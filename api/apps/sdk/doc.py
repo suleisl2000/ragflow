@@ -274,7 +274,7 @@ def update_doc(tenant_id, dataset_id, document_id):
     if "parser_config" in req:
         DocumentService.update_parser_config(doc.id, req["parser_config"])
     if "chunk_method" in req:
-        valid_chunk_method = {"naive", "manual", "qa", "table", "paper", "book", "laws", "presentation", "picture", "one", "knowledge_graph", "email", "tag"}
+        valid_chunk_method = {"naive", "manual", "qa", "table", "paper", "book", "laws", "presentation", "picture", "one", "knowledge_graph", "email", "tag", "custom"}
         if req.get("chunk_method") not in valid_chunk_method:
             return get_error_data_result(f"`chunk_method` {req['chunk_method']} doesn't exist")
 
@@ -1444,7 +1444,11 @@ def retrieval_test(tenant_id):
 
         if req.get("keyword", False):
             chat_mdl = LLMBundle(kb.tenant_id, LLMType.CHAT)
-            question += keyword_extraction(chat_mdl, question)
+            print(f"[RETRIEVAL DEBUG] 启用关键词增强 - 模型: {chat_mdl.llm_name}")
+            original_question = question
+            extracted_keywords = keyword_extraction(chat_mdl, question)
+            question += extracted_keywords
+            print(f"[RETRIEVAL DEBUG] 增强完成: '{original_question}' -> '{question}'")
 
         ranks = settings.retriever.retrieval(
             question,

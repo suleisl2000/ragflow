@@ -250,6 +250,7 @@ def chat_completion_openai_like(tenant_id, chat_id):
             answer_cache = ""
             reasoning_cache = ""
             last_ans = {}
+            first_chunk_sent = False
             response = {
                 "id": f"chatcmpl-{chat_id}",
                 "choices": [
@@ -277,6 +278,13 @@ def chat_completion_openai_like(tenant_id, chat_id):
                 for ans in chat(dia, msg, True, toolcall_session=toolcall_session, tools=tools, quote=need_reference):
                     last_ans = ans
                     answer = ans["answer"]
+
+                    # 如果是第一个chunk且需要引用信息，先发送引用信息
+                    if not first_chunk_sent and need_reference and ans.get("reference"):
+                        response["choices"][0]["delta"]["reference"] = chunks_format(ans.get("reference", []))
+                        response["choices"][0]["delta"]["final_content"] = answer
+                        yield f"data:{json.dumps(response, ensure_ascii=False)}\n\n"
+                        first_chunk_sent = True
 
                     reasoning_match = re.search(r"<think>(.*?)</think>", answer, flags=re.DOTALL)
                     if reasoning_match:
@@ -307,6 +315,10 @@ def chat_completion_openai_like(tenant_id, chat_id):
                     if not any([reasoning_incremental, content_incremental]):
                         continue
 
+                    # 清除引用信息，只保留内容
+                    response["choices"][0]["delta"]["reference"] = None
+                    response["choices"][0]["delta"]["final_content"] = None
+
                     if reasoning_incremental:
                         response["choices"][0]["delta"]["reasoning_content"] = reasoning_incremental
                     else:
@@ -326,9 +338,9 @@ def chat_completion_openai_like(tenant_id, chat_id):
             response["choices"][0]["delta"]["content"] = None
             response["choices"][0]["delta"]["reasoning_content"] = None
             response["choices"][0]["finish_reason"] = "stop"
-            response["usage"] = {"prompt_tokens": len(prompt), "completion_tokens": token_used,
-                                 "total_tokens": len(prompt) + token_used}
-            if need_reference:
+            response["usage"] = {"prompt_tokens": len(prompt), "completion_tokens": token_used, "total_tokens": len(prompt) + token_used}
+            # 如果第一个chunk没有发送引用信息，在最后一个chunk发送
+            if need_reference and not first_chunk_sent:
                 response["choices"][0]["delta"]["reference"] = chunks_format(last_ans.get("reference", []))
                 response["choices"][0]["delta"]["final_content"] = last_ans.get("answer", "")
             yield f"data:{json.dumps(response, ensure_ascii=False)}\n\n"

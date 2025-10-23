@@ -594,6 +594,41 @@ def chat(dialog, messages, stream=True, **kwargs):
     if stream:
         last_ans = ""
         answer = ""
+        first_chunk_sent = False
+        
+        # 预先生成引用信息，用于第一个chunk
+        reference_info = {}
+        if knowledges and (prompt_config.get("quote", True) and kwargs.get("quote", True)):
+            # 创建一个临时的完整答案来生成引用信息
+            temp_answer = " ".join(questions)  # 使用问题作为临时答案
+            if embd_mdl and not re.search(r"\[ID:([0-9]+)\]", temp_answer):
+                temp_answer, idx = retriever.insert_citations(
+                    temp_answer,
+                    [ck["content_ltks"] for ck in kbinfos["chunks"]],
+                    [ck["vector"] for ck in kbinfos["chunks"]],
+                    embd_mdl,
+                    tkweight=1 - dialog.vector_similarity_weight,
+                    vtweight=dialog.vector_similarity_weight,
+                )
+            else:
+                idx = set()
+                for match in re.finditer(r"\[ID:([0-9]+)\]", temp_answer):
+                    i = int(match.group(1))
+                    if i < len(kbinfos["chunks"]):
+                        idx.add(i)
+            
+            temp_answer, idx = repair_bad_citation_formats(temp_answer, kbinfos, idx)
+            idx = set([kbinfos["chunks"][int(i)]["doc_id"] for i in idx])
+            recall_docs = [d for d in kbinfos["doc_aggs"] if d["doc_id"] in idx]
+            if not recall_docs:
+                recall_docs = kbinfos["doc_aggs"]
+            kbinfos["doc_aggs"] = recall_docs
+            
+            reference_info = deepcopy(kbinfos)
+            for c in reference_info["chunks"]:
+                if c.get("vector"):
+                    del c["vector"]
+        
         for ans in chat_mdl.chat_streamly(prompt + prompt4citation, msg[1:], gen_conf):
             if thought:
                 ans = re.sub(r"^.*</think>", "", ans, flags=re.DOTALL)
@@ -602,11 +637,24 @@ def chat(dialog, messages, stream=True, **kwargs):
             if num_tokens_from_string(delta_ans) < 16:
                 continue
             last_ans = answer
-            yield {"answer": thought + answer, "reference": {}, "audio_binary": tts(tts_mdl, delta_ans)}
+            
+            # 如果是第一个chunk且有引用信息，发送引用信息
+            if not first_chunk_sent and reference_info:
+                yield {"answer": thought + answer, "reference": reference_info, "audio_binary": tts(tts_mdl, delta_ans)}
+                first_chunk_sent = True
+            else:
+                yield {"answer": thought + answer, "reference": {}, "audio_binary": tts(tts_mdl, delta_ans)}
+        
         delta_ans = answer[len(last_ans):]
         if delta_ans:
             yield {"answer": thought + answer, "reference": {}, "audio_binary": tts(tts_mdl, delta_ans)}
-        yield decorate_answer(thought + answer)
+        
+        # 最后发送完整的引用信息（如果第一个chunk没有发送）
+        if not first_chunk_sent:
+            yield decorate_answer(thought + answer)
+        else:
+            # 只发送最终答案，不重复发送引用信息
+            yield {"answer": thought + answer, "reference": reference_info, "prompt": "", "created_at": time.time()}
     else:
         answer = chat_mdl.chat(prompt + prompt4citation, msg[1:], gen_conf)
         user_content = msg[-1].get("content", "[content not available]")
