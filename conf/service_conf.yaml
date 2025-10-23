@@ -25,19 +25,6 @@ infinity:
   uri: '127.0.0.1:23817'
   db_name: 'default_db'
 
-# 搜索引擎配置 - 仅使用Infinity
-# Elasticsearch配置已禁用
-# es:
-#   hosts: 'http://47.111.29.197:9200'
-#   username: 'elastic'
-#   password: 'your_elasticsearch_password'
-
-# OpenSearch配置已禁用
-# os:
-#   hosts: 'http://47.111.29.197:9201'
-#   username: 'admin'
-#   password: 'your_opensearch_password'
-
 redis:
   db: 1
   password: 'infini_rag_flow'
@@ -45,7 +32,7 @@ redis:
 
 user_default_llm:
   factory: 'Tongyi-Qianwen'
-  api_key: 'sk-f350af358de3452898f337e61be3f2c1'
+  api_key: 'sk-xxx'
   base_url: 'https://dashscope.aliyuncs.com/compatible-mode/v1'
   default_models:
     chat_model:
