@@ -38,11 +38,11 @@ user_default_llm:
     chat_model:
       name: 'qwen-plus'
       factory: 'Tongyi-Qianwen'
-      api_key: 'sk-f350af358de3452898f337e61be3f2c1'
+      api_key: 'sk-xxx'
       base_url: 'https://dashscope.aliyuncs.com/compatible-mode/v1'
     embedding_model:
       name: 'text-embedding-v3'
       factory: 'Tongyi-Qianwen'
-      api_key: 'sk-f350af358de3452898f337e61be3f2c1'
+      api_key: 'sk-xxx'
       base_url: 'https://dashscope.aliyuncs.com/compatible-mode/v1'
 
