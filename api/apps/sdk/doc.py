@@ -44,6 +44,13 @@ from rag.prompts.generator import cross_languages, keyword_extraction
 from rag.utils import rmSpace
 from rag.utils.storage_factory import STORAGE_IMPL
 
+# PICO检索支持
+from api.apps.pico_utils import PICO_RETRIEVAL_AVAILABLE, _is_evidence_based_medical_query, _get_retrieval_strategy
+try:
+    from rag.retrieval import PICORetriever
+except ImportError:
+    PICORetriever = None
+
 MAXIMUM_OF_UPLOADING_FILES = 256
 
 
@@ -1442,29 +1449,76 @@ def retrieval_test(tenant_id):
         if langs:
             question = cross_languages(kb.tenant_id, None, question, langs)
 
+        chat_mdl = LLMBundle(kb.tenant_id, LLMType.CHAT)
+        
+        # 判断检索策略
+        strategy = _get_retrieval_strategy(req, question, chat_mdl)
+        
+        # 关键词扩展（如果启用）
         if req.get("keyword", False):
-            chat_mdl = LLMBundle(kb.tenant_id, LLMType.CHAT)
             print(f"[RETRIEVAL DEBUG] 启用关键词增强 - 模型: {chat_mdl.llm_name}")
             original_question = question
             extracted_keywords = keyword_extraction(chat_mdl, question)
             question += extracted_keywords
             print(f"[RETRIEVAL DEBUG] 增强完成: '{original_question}' -> '{question}'")
 
-        ranks = settings.retriever.retrieval(
-            question,
-            embd_mdl,
-            tenant_ids,
-            kb_ids,
-            page,
-            size,
-            similarity_threshold,
-            vector_similarity_weight,
-            top,
-            doc_ids,
-            rerank_mdl=rerank_mdl,
-            highlight=highlight,
-            rank_feature=label_question(question, kbs),
-        )
+        logging.info(f"[检索请求] question={question[:100]}..., kb_ids={kb_ids}, page={page}, size={size}")
+
+        # 执行检索
+        if strategy == "pico" and PICO_RETRIEVAL_AVAILABLE:
+            logging.info(f"[PICO检索] 开始执行PICO检索")
+            try:
+                pico_retriever = PICORetriever(
+                    data_store=settings.retriever.dataStore,
+                    embd_mdl=embd_mdl,
+                    chat_mdl=chat_mdl,
+                    strict_mode=req.get("pico_strict_mode", True)
+                )
+                ranks = pico_retriever.retrieval(
+                    question=question,
+                    tenant_ids=tenant_ids,
+                    kb_ids=kb_ids,
+                    page=page,
+                    page_size=size,
+                    topk_per_dimension=req.get("pico_topk_per_dimension", 300),
+                    max_chunks_per_doc=req.get("pico_max_chunks_per_doc", 10)
+                )
+                logging.info(f"[PICO检索] 检索完成，返回 {len(ranks.get('chunks', []))} 个chunks")
+            except Exception as e:
+                logging.error(f"[PICO检索] PICO检索发生异常，回退到标准检索: {e}", exc_info=True)
+                ranks = settings.retriever.retrieval(
+                    question,
+                    embd_mdl,
+                    tenant_ids,
+                    kb_ids,
+                    page,
+                    size,
+                    similarity_threshold,
+                    vector_similarity_weight,
+                    top,
+                    doc_ids,
+                    rerank_mdl=rerank_mdl,
+                    highlight=highlight,
+                    rank_feature=label_question(question, kbs),
+                )
+        else:
+            logging.info(f"[标准检索] 开始执行标准检索")
+            ranks = settings.retriever.retrieval(
+                question,
+                embd_mdl,
+                tenant_ids,
+                kb_ids,
+                page,
+                size,
+                similarity_threshold,
+                vector_similarity_weight,
+                top,
+                doc_ids,
+                rerank_mdl=rerank_mdl,
+                highlight=highlight,
+                rank_feature=label_question(question, kbs),
+            )
+            logging.info(f"[标准检索] 检索完成，返回 {len(ranks.get('chunks', []))} 个chunks")
         if use_kg:
             ck = settings.kg_retriever.retrieval(question, [k.tenant_id for k in kbs], kb_ids, embd_mdl, LLMBundle(kb.tenant_id, LLMType.CHAT))
             if ck["content_with_weight"]:

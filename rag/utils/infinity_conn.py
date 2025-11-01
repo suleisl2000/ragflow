@@ -392,7 +392,7 @@ class InfinityConnection(DocStoreConnection):
                 logger.debug(f"INFINITY search FusionExpr: {json.dumps(matchExpr.__dict__)}")
 
         order_by_expr_list = list()
-        if orderBy.fields:
+        if orderBy and orderBy.fields:
             for order_field in orderBy.fields:
                 if order_field[1] == 0:
                     order_by_expr_list.append((order_field[0], SortType.Asc))
@@ -434,7 +434,7 @@ class InfinityConnection(DocStoreConnection):
                 else:
                     if filter_cond and len(filter_cond) > 0:
                         builder.filter(filter_cond)
-                if orderBy.fields:
+                if orderBy and orderBy.fields:
                     builder.sort(order_by_expr_list)
                 builder.offset(offset).limit(limit)
                 kb_res, extra_result = builder.option({"total_hits_count": True}).to_df()

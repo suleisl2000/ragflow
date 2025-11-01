@@ -14,6 +14,7 @@
 #  limitations under the License.
 #
 import json
+import logging
 import os
 import re
 from datetime import datetime, timedelta
@@ -41,6 +42,13 @@ from api.utils.file_utils import filename_type, thumbnail
 from rag.app.tag import label_question
 from rag.prompts.generator import keyword_extraction
 from rag.utils.storage_factory import STORAGE_IMPL
+
+# PICO检索支持
+from api.apps.pico_utils import PICO_RETRIEVAL_AVAILABLE, _is_evidence_based_medical_query, _get_retrieval_strategy
+try:
+    from rag.retrieval import PICORetriever
+except ImportError:
+    PICORetriever = None
 
 from api.db.services.canvas_service import UserCanvasService
 from agent.canvas import Canvas
@@ -869,6 +877,8 @@ def retrieval():
     top = int(req.get("top_k", 1024))
     highlight = bool(req.get("highlight", False)) 
 
+    logging.info(f"[检索请求] question={question[:100]}..., kb_ids={kb_ids}, page={page}, size={size}")
+
     try:
         kbs = KnowledgebaseService.get_by_ids(kb_ids)
         embd_nms = list(set([kb.embd_id for kb in kbs]))
@@ -878,17 +888,53 @@ def retrieval():
                 code=settings.RetCode.AUTHENTICATION_ERROR)
 
         embd_mdl = LLMBundle(kbs[0].tenant_id, LLMType.EMBEDDING, llm_name=kbs[0].embd_id)
+        chat_mdl = LLMBundle(kbs[0].tenant_id, LLMType.CHAT)
         rerank_mdl = None
         if req.get("rerank_id"):
             rerank_mdl = LLMBundle(kbs[0].tenant_id, LLMType.RERANK, llm_name=req["rerank_id"])
+        
+        # 判断检索策略
+        strategy = _get_retrieval_strategy(req, question, chat_mdl)
+        
+        # 关键词扩展（如果启用）
         if req.get("keyword", False):
-            chat_mdl = LLMBundle(kbs[0].tenant_id, LLMType.CHAT)
             question += keyword_extraction(chat_mdl, question)
-        ranks = settings.retriever.retrieval(question, embd_mdl, kbs[0].tenant_id, kb_ids, page, size,
-                                               similarity_threshold, vector_similarity_weight, top,
-                                               doc_ids, rerank_mdl=rerank_mdl, highlight= highlight,
-                                               rank_feature=label_question(question, kbs))
-        for c in ranks["chunks"]:
+        
+        # 执行检索
+        if strategy == "pico" and PICO_RETRIEVAL_AVAILABLE:
+            logging.info(f"[PICO检索] 开始执行PICO检索")
+            try:
+                pico_retriever = PICORetriever(
+                    data_store=settings.retriever.dataStore,
+                    embd_mdl=embd_mdl,
+                    chat_mdl=chat_mdl,
+                    strict_mode=req.get("pico_strict_mode", True)
+                )
+                ranks = pico_retriever.retrieval(
+                    question=question,
+                    tenant_ids=[kbs[0].tenant_id],
+                    kb_ids=kb_ids,
+                    page=page,
+                    page_size=size,
+                    topk_per_dimension=req.get("pico_topk_per_dimension", 300),
+                    max_chunks_per_doc=req.get("pico_max_chunks_per_doc", 10)
+                )
+                logging.info(f"[PICO检索] 检索完成，返回 {len(ranks.get('chunks', []))} 个chunks")
+            except Exception as e:
+                logging.error(f"[PICO检索] PICO检索发生异常，回退到标准检索: {e}", exc_info=True)
+                ranks = settings.retriever.retrieval(question, embd_mdl, kbs[0].tenant_id, kb_ids, page, size,
+                                                     similarity_threshold, vector_similarity_weight, top,
+                                                     doc_ids, rerank_mdl=rerank_mdl, highlight=highlight,
+                                                     rank_feature=label_question(question, kbs))
+        else:
+            logging.info(f"[标准检索] 开始执行标准检索")
+            ranks = settings.retriever.retrieval(question, embd_mdl, kbs[0].tenant_id, kb_ids, page, size,
+                                                 similarity_threshold, vector_similarity_weight, top,
+                                                 doc_ids, rerank_mdl=rerank_mdl, highlight=highlight,
+                                                 rank_feature=label_question(question, kbs))
+            logging.info(f"[标准检索] 检索完成，返回 {len(ranks.get('chunks', []))} 个chunks")
+        
+        for c in ranks.get("chunks", []):
             c.pop("vector", None)
         return get_json_result(data=ranks)
     except Exception as e:
