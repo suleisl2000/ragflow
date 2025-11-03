@@ -376,6 +376,8 @@ class InfinityConnection(DocStoreConnection):
                 for k, v in matchExpr.extra_options.items():
                     if not isinstance(v, str):
                         matchExpr.extra_options[k] = str(v)
+                logger.info(f"[INFINITY MatchTextExpr] fields={fields}, matching_text={matchExpr.matching_text[:200]}, "
+                           f"options_text will include: {matchExpr.extra_options}")
                 logger.debug(f"INFINITY search MatchTextExpr: {json.dumps(matchExpr.__dict__)}")
             elif isinstance(matchExpr, MatchDenseExpr):
                 if filter_fulltext and "filter" not in matchExpr.extra_options:

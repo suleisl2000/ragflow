@@ -21,6 +21,7 @@ PICO框架医疗检索系统
 
 import logging
 import json
+import re
 import hashlib
 import time
 from typing import Dict, List, Optional, Tuple, Set
@@ -28,7 +29,7 @@ from dataclasses import dataclass
 from collections import defaultdict
 
 import numpy as np
-from rag.nlp import search, rag_tokenizer, synonym, query
+from rag.nlp import search, rag_tokenizer, synonym, query, is_chinese
 from rag.utils.doc_store_conn import MatchTextExpr, MatchDenseExpr, FusionExpr
 try:
     from api.db.services.llm_service import LLMBundle
@@ -173,8 +174,6 @@ class PICOQueryRewriter:
     
     def _extract_json_from_response(self, response: str) -> dict:
         """从LLM响应中提取JSON"""
-        import re
-        import json
         
         # 方法1: 尝试找到第一个 { 和最后一个 }，处理嵌套大括号
         start_idx = response.find('{')
@@ -341,20 +340,65 @@ class PICOSynonymExpander:
         """
         terms = self.expand(dimension)
         
-        # 处理包含空格的术语（加引号）
-        quoted_terms = []
-        for term in terms:
-            term = term.strip()
-            if not term:
-                continue
-            # 转义特殊字符
-            term = query.FulltextQueryer.subSpecialChar(term)
-            if ' ' in term:
-                quoted_terms.append(f'"{term}"')
+        # 处理术语（针对中文短语的特殊处理）
+        # 问题根源：Infinity的whitespace analyzer对无空格中文文本只返回1个token
+        #   - 查询文本 "降低血糖" → whitespace analyzer → ["降低血糖"] (1个token)
+        #   - 但文档存储时使用rag_tokenizer.tokenize()分词为: ["降低", "血糖"] (2个独立token)
+        #   - 引号短语查询查找token "降低血糖"，索引中不存在 → 返回0结果
+        # 解决方案：使用和文档存储时相同的分词器(rag_tokenizer)进行分词
+        #   - 如果分词结果为多个token，使用AND查询
+        #   - 如果分词结果为1个token，直接使用
+        def process_term(term_str):
+            """处理单个术语，使用与文档存储时相同的分词器"""
+            term_str = term_str.strip()
+            if not term_str:
+                return None
+            
+            # 转义特殊字符（使用ragflow的标准方法）
+            term_str = query.FulltextQueryer.subSpecialChar(term_str)
+            
+            # 检查是否为中文短语（使用ragflow的is_chinese方法）
+            # is_chinese检查文本中中文字符占比是否>20%
+            has_chinese = is_chinese(term_str)
+            
+            # 如果包含空格，可能是英文短语（如 "glycemic control"），用引号包裹
+            if ' ' in term_str:
+                return f'"{term_str}"'
+            
+            # 对于中文短语，使用rag_tokenizer进行分词（与文档存储时一致）
+            if has_chinese and len(term_str) > 2:
+                # 使用相同的分词器进行分词
+                tokenized = rag_tokenizer.tokenize(term_str)
+                tokens = tokenized.split()
+                
+                # 如果分词结果为多个token，使用AND查询
+                if len(tokens) > 1:
+                    # 每个token用引号包裹，用AND连接
+                    quoted_tokens = [f'"{token}"' for token in tokens if token.strip()]
+                    if quoted_tokens:
+                        return ' AND '.join(quoted_tokens)
+                    else:
+                        return term_str
+                else:
+                    # 如果分词结果只有1个token，直接返回（不需要引号）
+                    return tokens[0] if tokens else term_str
             else:
-                quoted_terms.append(term)
+                # 单个词或不包含中文的术语，直接返回
+                return term_str
         
-        return " OR ".join(quoted_terms[:50])  # 限制最多50个术语避免查询过长
+        processed_terms = []
+        for term in terms:
+            processed = process_term(term)
+            if processed:
+                processed_terms.append(processed)
+        
+        if len(processed_terms) == 1:
+            query_text = processed_terms[0]
+        else:
+            query_text = " OR ".join(processed_terms[:50])  # OR连接，限制最多50个术语
+        logging.info(f"[查询文本构建] 维度 {dimension.text if hasattr(dimension, 'text') else 'unknown'}, "
+                    f"扩展术语数: {len(terms)}, 构建查询: {query_text[:200]}...")
+        return query_text
 
 
 class PICOParallelRetriever:
@@ -396,13 +440,19 @@ class PICOParallelRetriever:
         
         # 构建OR查询文本
         query_text = self.synonym_expander.build_query_text(dimension)
+        logging.info(f"[维度检索] 开始检索维度，查询文本长度: {len(query_text)}, topk={topk}")
         
         # 构建关键词检索表达式
+        # 使用显式OR语法：'term1 OR term2 OR ...'
+        # Infinity的match_text支持显式OR语法（默认operator_option=kInfinitySyntax）
+        # minimum_should_match="1" 表示至少匹配1个术语，确保OR语义
         match_text = MatchTextExpr(
             fields=["content_ltks", "important_kwd", "title_tks", "question_tks"],
             matching_text=query_text,
             topn=topk,
-            extra_options={"minimum_should_match": "60%"}
+            extra_options={
+                "minimum_should_match": "1"  # 至少匹配1个，确保OR语义
+            }
         )
         
         # 构建向量检索表达式
@@ -437,6 +487,10 @@ class PICOParallelRetriever:
         # 3. ES/OS 会在 search 方法中自动添加 kb_id 到 condition
         filters = {}
         
+        logging.info(f"[维度检索执行] 维度 {dimension.text if hasattr(dimension, 'text') else 'unknown'}, "
+                    f"查询文本: {query_text[:150]}, fields: {match_text.fields}, "
+                    f"extra_options: {match_text.extra_options}")
+        
         res, total = self.data_store.search(
             selectFields=["id", "doc_id", "content_ltks", vector_column_name, 
                          "title_tks", "important_kwd", "docnm_kwd"],
@@ -449,6 +503,10 @@ class PICOParallelRetriever:
             indexNames=idx_names,
             knowledgebaseIds=kb_ids
         )
+        
+        logging.info(f"[维度检索结果] 维度 {dimension.text if hasattr(dimension, 'text') else 'unknown'}, "
+                    f"Infinity返回: total={total}, res.empty={res.empty if hasattr(res, 'empty') else 'N/A'}, "
+                    f"res.shape={res.shape if hasattr(res, 'shape') else 'N/A'}")
         
         # 转换为SearchResult格式
         # Infinity 表中的字段名是 "id"，不是 "chunk_id"
