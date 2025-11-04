@@ -492,7 +492,7 @@ class PICOParallelRetriever:
                     f"extra_options: {match_text.extra_options}")
         
         res, total = self.data_store.search(
-            selectFields=["id", "doc_id", "content_ltks", vector_column_name, 
+            selectFields=["id", "doc_id", "content_ltks", "content_with_weight", vector_column_name, 
                          "title_tks", "important_kwd", "docnm_kwd"],
             highlightFields=[],
             condition=filters,
@@ -509,12 +509,27 @@ class PICOParallelRetriever:
                     f"res.shape={res.shape if hasattr(res, 'shape') else 'N/A'}")
         
         # 转换为SearchResult格式
+        # 使用dataStore.getFields方法处理字段格式转换（处理keyword字段、列表等）
         # Infinity 表中的字段名是 "id"，不是 "chunk_id"
-        chunk_ids = res['id'].tolist() if 'id' in res.columns and not res.empty else []
-        fields = {}
-        for _, row in res.iterrows():
-            chunk_id = str(row.get('id', ''))
-            fields[chunk_id] = row.to_dict()
+        select_fields = ["id", "doc_id", "content_ltks", "content_with_weight", vector_column_name, 
+                        "title_tks", "important_kwd", "docnm_kwd"]
+        fields = self.data_store.getFields(res, select_fields)
+        chunk_ids = self.data_store.getChunkIds(res)
+        
+        # 输出匹配的chunk ID和内容（用于调试和对比）
+        logging.info(f"[维度检索结果] 维度 {dimension.text if hasattr(dimension, 'text') else 'unknown'}, "
+                    f"匹配到 {len(chunk_ids)} 个chunks")
+        if chunk_ids:
+            logging.info(f"[维度检索结果] 匹配的chunk IDs: {chunk_ids[:20]}{'...' if len(chunk_ids) > 20 else ''}")
+            # 输出前10个chunks的详细信息
+            for i, chunk_id in enumerate(chunk_ids[:10], 1):
+                chunk_info = fields.get(chunk_id, {})
+                doc_id = chunk_info.get('doc_id', '')
+                doc_name = chunk_info.get('docnm_kwd', '')
+                content = chunk_info.get('content_with_weight', '') or chunk_info.get('content_ltks', '')
+                content_preview = content[:200] + "..." if len(content) > 200 else content
+                logging.info(f"[维度检索结果]   Chunk {i} (ID: {chunk_id}, Doc: {doc_name}):")
+                logging.info(f"[维度检索结果]     Content: {content_preview}")
         
         return search.Dealer.SearchResult(
             total=total,
@@ -631,7 +646,7 @@ class PIOArticleFilter:
         
         # 统计每个chunk的P/I/O命中情况
         chunk_hits = defaultdict(lambda: {"P": False, "I": False, "O": False, "C": False})
-        doc_chunks = defaultdict(list)
+        doc_chunks = defaultdict(set)  # 使用set避免重复
         
         for dim_name, search_result in pico_results.items():
             for chunk_id in search_result.ids:
@@ -641,8 +656,11 @@ class PIOArticleFilter:
                 if not doc_id:
                     continue
                 
-                doc_chunks[doc_id].append(chunk_id)
+                doc_chunks[doc_id].add(chunk_id)  # 使用add而不是append，自动去重
                 chunk_hits[chunk_id][dim_name] = True
+        
+        # 转换为list以便后续处理
+        doc_chunks = {doc_id: list(chunk_ids) for doc_id, chunk_ids in doc_chunks.items()}
         
         logging.debug(f"[文章级筛查] 涉及 {len(doc_chunks)} 篇文章，总计 {sum(len(cids) for cids in doc_chunks.values())} 个chunks")
         
@@ -650,20 +668,116 @@ class PIOArticleFilter:
         valid_docs = {}
         
         for doc_id, chunk_ids in doc_chunks.items():
-            doc_p_hit = any(chunk_hits[cid]["P"] for cid in chunk_ids)
-            doc_i_hit = any(chunk_hits[cid]["I"] for cid in chunk_ids)
-            doc_o_hit = any(chunk_hits[cid]["O"] for cid in chunk_ids)
+            # 找出命中每个维度的chunk ID列表，用于详细日志
+            # 使用list(dict.fromkeys())去重，保持顺序
+            p_hit_chunks = list(dict.fromkeys([cid for cid in chunk_ids if chunk_hits[cid]["P"]]))
+            i_hit_chunks = list(dict.fromkeys([cid for cid in chunk_ids if chunk_hits[cid]["I"]]))
+            o_hit_chunks = list(dict.fromkeys([cid for cid in chunk_ids if chunk_hits[cid]["O"]]))
+            
+            doc_p_hit = len(p_hit_chunks) > 0
+            doc_i_hit = len(i_hit_chunks) > 0
+            doc_o_hit = len(o_hit_chunks) > 0
             
             # 严格模式：必须同时满足P+I+O
             if self.strict_mode:
                 if doc_p_hit and doc_i_hit and doc_o_hit:
                     valid_docs[doc_id] = chunk_ids
-                    logging.debug(f"[文章级筛查] 文章 {doc_id} 通过筛查（严格模式）: P={doc_p_hit}, I={doc_i_hit}, O={doc_o_hit}")
+                    # 获取文档标题用于日志
+                    doc_title = None
+                    for chunk_id in chunk_ids:
+                        for search_result in pico_results.values():
+                            if chunk_id in search_result.ids:
+                                field = search_result.field.get(chunk_id, {})
+                                doc_title = field.get('docnm_kwd', '')
+                                if doc_title:
+                                    break
+                        if doc_title:
+                            break
+                    logging.info(f"[文章级筛查] 文章通过筛查（严格模式）: doc_id={doc_id}, doc_title={doc_title}, "
+                               f"P命中{len(p_hit_chunks)}个chunks, I命中{len(i_hit_chunks)}个chunks, "
+                               f"O命中{len(o_hit_chunks)}个chunks")
+                    
+                    # 输出每个维度命中的chunk内容示例（前2个）
+                    if p_hit_chunks:
+                        logging.info(f"[文章级筛查]   P维度命中chunk示例:")
+                        for i, cid in enumerate(p_hit_chunks[:2]):
+                            for search_result in pico_results.values():
+                                if cid in search_result.ids:
+                                    field = search_result.field.get(cid, {})
+                                    content = field.get('content_with_weight', '') or field.get('content_ltks', '')
+                                    if content:
+                                        logging.info(f"[文章级筛查]     Chunk {cid}: {content[:150]}...")
+                                        break
+                    if i_hit_chunks:
+                        logging.info(f"[文章级筛查]   I维度命中chunk示例:")
+                        for i, cid in enumerate(i_hit_chunks[:2]):
+                            for search_result in pico_results.values():
+                                if cid in search_result.ids:
+                                    field = search_result.field.get(cid, {})
+                                    content = field.get('content_with_weight', '') or field.get('content_ltks', '')
+                                    if content:
+                                        logging.info(f"[文章级筛查]     Chunk {cid}: {content[:150]}...")
+                                        break
+                    if o_hit_chunks:
+                        logging.info(f"[文章级筛查]   O维度命中chunk示例:")
+                        for i, cid in enumerate(o_hit_chunks[:2]):
+                            for search_result in pico_results.values():
+                                if cid in search_result.ids:
+                                    field = search_result.field.get(cid, {})
+                                    content = field.get('content_with_weight', '') or field.get('content_ltks', '')
+                                    if content:
+                                        logging.info(f"[文章级筛查]     Chunk {cid}: {content[:150]}...")
+                                        break
             else:
                 # 宽松模式：至少满足P+I或I+O
                 if (doc_p_hit and doc_i_hit) or (doc_i_hit and doc_o_hit):
                     valid_docs[doc_id] = chunk_ids
-                    logging.debug(f"[文章级筛查] 文章 {doc_id} 通过筛查（宽松模式）: P={doc_p_hit}, I={doc_i_hit}, O={doc_o_hit}")
+                    # 获取文档标题用于日志
+                    doc_title = None
+                    for chunk_id in chunk_ids:
+                        for search_result in pico_results.values():
+                            if chunk_id in search_result.ids:
+                                field = search_result.field.get(chunk_id, {})
+                                doc_title = field.get('docnm_kwd', '')
+                                if doc_title:
+                                    break
+                        if doc_title:
+                            break
+                    logging.info(f"[文章级筛查] 文章通过筛查（宽松模式）: doc_id={doc_id}, doc_title={doc_title}, "
+                               f"P命中{len(p_hit_chunks)}个chunks, I命中{len(i_hit_chunks)}个chunks, "
+                               f"O命中{len(o_hit_chunks)}个chunks")
+                    
+                    # 输出每个维度命中的chunk内容示例（前2个）
+                    if p_hit_chunks:
+                        logging.info(f"[文章级筛查]   P维度命中chunk示例:")
+                        for i, cid in enumerate(p_hit_chunks[:2]):
+                            for search_result in pico_results.values():
+                                if cid in search_result.ids:
+                                    field = search_result.field.get(cid, {})
+                                    content = field.get('content_with_weight', '') or field.get('content_ltks', '')
+                                    if content:
+                                        logging.info(f"[文章级筛查]     Chunk {cid}: {content[:150]}...")
+                                        break
+                    if i_hit_chunks:
+                        logging.info(f"[文章级筛查]   I维度命中chunk示例:")
+                        for i, cid in enumerate(i_hit_chunks[:2]):
+                            for search_result in pico_results.values():
+                                if cid in search_result.ids:
+                                    field = search_result.field.get(cid, {})
+                                    content = field.get('content_with_weight', '') or field.get('content_ltks', '')
+                                    if content:
+                                        logging.info(f"[文章级筛查]     Chunk {cid}: {content[:150]}...")
+                                        break
+                    if o_hit_chunks:
+                        logging.info(f"[文章级筛查]   O维度命中chunk示例:")
+                        for i, cid in enumerate(o_hit_chunks[:2]):
+                            for search_result in pico_results.values():
+                                if cid in search_result.ids:
+                                    field = search_result.field.get(cid, {})
+                                    content = field.get('content_with_weight', '') or field.get('content_ltks', '')
+                                    if content:
+                                        logging.info(f"[文章级筛查]     Chunk {cid}: {content[:150]}...")
+                                        break
         
         logging.info(f"[文章级筛查] 筛查完成，通过 {len(valid_docs)}/{len(doc_chunks)} 篇文章")
         return valid_docs
@@ -834,6 +948,18 @@ class PICORetriever:
                     f"I维度: {len(pico_results.get('I', {}).ids)} chunks, "
                     f"O维度: {len(pico_results.get('O', {}).ids)} chunks")
         
+        # 输出PICO提取的关键词详情（用于调试为什么某些文档会匹配）
+        logging.info(f"[PICO检索] PICO提取的关键词详情:")
+        logging.info(f"[PICO检索]   P维度: text={pico.P.text if pico.P else None}, "
+                    f"keywords={pico.P.keywords if pico.P else []}, "
+                    f"synonyms={pico.P.synonyms[:10] if pico.P and pico.P.synonyms else []}")
+        logging.info(f"[PICO检索]   I维度: text={pico.I.text if pico.I else None}, "
+                    f"keywords={pico.I.keywords if pico.I else []}, "
+                    f"synonyms={pico.I.synonyms[:10] if pico.I and pico.I.synonyms else []}")
+        logging.info(f"[PICO检索]   O维度: text={pico.O.text if pico.O else None}, "
+                    f"keywords={pico.O.keywords if pico.O else []}, "
+                    f"synonyms={pico.O.synonyms[:10] if pico.O and pico.O.synonyms else []}")
+        
         # 3. 文章级PIO筛查
         logging.info(f"[PICO检索] 步骤3: 开始文章级PIO筛查，strict_mode={self.filter.strict_mode}")
         valid_docs = self.filter.filter(pico_results)
@@ -842,6 +968,41 @@ class PICORetriever:
         if not valid_docs:
             logging.warning(f"[PICO检索] 未找到满足PIO条件的文章，返回空结果")
             return {"total": 0, "chunks": [], "doc_aggs": {}}
+        
+        # 输出满足PIO条件的文章标题和chunks内容
+        logging.info(f"[PICO检索] ========== 满足PIO条件的文章详情 ==========")
+        for doc_id, chunk_ids in valid_docs.items():
+            # 获取文档标题（从任意一个chunk中获取docnm_kwd）
+            doc_title = None
+            doc_chunks_info = []
+            
+            for chunk_id in chunk_ids:
+                chunk_info = None
+                for search_result in pico_results.values():
+                    if chunk_id in search_result.ids:
+                        chunk_info = search_result.field.get(chunk_id, {})
+                        break
+                
+                if chunk_info:
+                    if not doc_title:
+                        doc_title = chunk_info.get("docnm_kwd", "")
+                    # 获取chunk内容
+                    content = chunk_info.get("content_with_weight", "") or chunk_info.get("content_ltks", "")
+                    if content:
+                        doc_chunks_info.append({
+                            "chunk_id": chunk_id,
+                            "content_preview": content[:200] + "..." if len(content) > 200 else content
+                        })
+            
+            logging.info(f"[PICO检索] 文章ID: {doc_id}")
+            logging.info(f"[PICO检索] 文章标题: {doc_title}")
+            logging.info(f"[PICO检索] 包含chunks数: {len(chunk_ids)}")
+            for idx, chunk_info in enumerate(doc_chunks_info[:8], 1):  # 只显示前5个chunks
+                logging.info(f"[PICO检索]   Chunk {idx} (ID: {chunk_info['chunk_id']}):")
+                logging.info(f"[PICO检索]     {chunk_info['content_preview']}")
+            if len(doc_chunks_info) > 8:
+                logging.info(f"[PICO检索]   ... 还有 {len(doc_chunks_info) - 5} 个chunks未显示")
+        logging.info(f"[PICO检索] ============================================")
         
         # 4. 文章内chunk重排序
         logging.info(f"[PICO检索] 步骤4: 开始文章内chunk重排序，max_chunks_per_doc={max_chunks_per_doc}")
@@ -873,7 +1034,7 @@ class PICORetriever:
                 chunks.append({
                     "chunk_id": chunk_id,
                     "doc_id": chunk_info.get("doc_id", ""),
-                    "content_with_weight": chunk_info.get("content_ltks", ""),
+                    "content_with_weight": chunk_info.get("content_with_weight", "") or chunk_info.get("content_ltks", ""),
                     "similarity": 1.0,  # TODO: 计算实际相似度
                     "docnm_kwd": chunk_info.get("docnm_kwd", ""),
                 })
