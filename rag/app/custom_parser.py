@@ -20,6 +20,7 @@ import json
 import os
 import copy
 import hashlib
+import requests
 from typing import List, Dict, Any, Optional
 from collections import Counter
 
@@ -27,8 +28,59 @@ from rag.nlp import rag_tokenizer, tokenize, add_positions, tokenize_chunks, bul
 from api.db import ParserType, LLMType
 from api.db.services.llm_service import LLMBundle         
 from rag.prompts.generator import keyword_extraction
+from rag.utils.storage_factory import STORAGE_IMPL
+from api.utils.configs import read_config
 
 logger = logging.getLogger(__name__)
+
+
+class OCRClient:
+    """
+    Textin OCR API客户端
+    """
+    def __init__(self, app_id: str, secret_code: str, api_url: str = None):
+        self.app_id = app_id
+        self.secret_code = secret_code
+        self.api_url = api_url or "https://api.textin.com/ai/service/v1/pdf_to_markdown"
+    
+    def recognize(self, file_content: bytes, options: dict = None) -> str:
+        """
+        调用OCR API解析PDF文件
+        
+        Args:
+            file_content: PDF文件的二进制内容
+            options: OCR选项（可选）
+        
+        Returns:
+            OCR API返回的JSON字符串（包含result字段）
+        """
+        if options is None:
+            options = {}
+        
+        # 构建请求参数
+        params = {}
+        for key, value in options.items():
+            params[key] = str(value)
+        
+        # 设置请求头
+        headers = {
+            "x-ti-app-id": self.app_id,
+            "x-ti-secret-code": self.secret_code,
+            "Content-Type": "application/octet-stream"
+        }
+        
+        # 发送请求
+        response = requests.post(
+            self.api_url,
+            params=params,
+            headers=headers,
+            data=file_content,
+            timeout=300  # OCR可能需要较长时间
+        )
+        
+        # 检查响应状态
+        response.raise_for_status()
+        return response.text
 
 
 class CustomPdfParser:
@@ -57,6 +109,15 @@ class CustomPdfParser:
         # 关键词缓存（基于内容hash）
         self._keyword_cache = {}
         self._max_cache_size = 100  # 最大缓存条目数
+        
+        # OCR配置初始化
+        self.ocr_client = None
+        self._init_ocr_config()
+        
+        # 缓存bucket配置（MinIO bucket名称不能包含下划线，使用连字符）
+        self.pdf_cache_bucket = self.custom_config.get("pdf_cache_bucket", "pdf-cache")
+        self.json_cache_bucket = self.custom_config.get("json_cache_bucket", "json-cache")
+        logger.info(f"[解析器初始化] 缓存bucket配置: PDF={self.pdf_cache_bucket}, JSON={self.json_cache_bucket}")
     
     def _init_llm_model(self):
         """初始化LLM模型用于关键词生成"""
@@ -117,22 +178,26 @@ class CustomPdfParser:
         """
         if self.chat_mdl:
             try:
+                logger.debug(f"[关键词生成] 使用LLM生成关键词: context={context}, topn={topn}, 内容长度={len(content)}")
                 # 使用LLM生成关键词
                 generated_keywords = keyword_extraction(self.chat_mdl, content, topn=topn)
                 if generated_keywords:
                     # 将生成的关键词按逗号分割并添加到列表中
                     keyword_list = [kw.strip() for kw in generated_keywords.split(",") if kw.strip()]
                     important_tks = rag_tokenizer.fine_grained_tokenize(" ".join(keyword_list))
-                    logger.info(f"Generated keywords for {context}: {keyword_list}")
+                    logger.info(f"[关键词生成] ✓ LLM生成关键词成功: context={context}, keywords={keyword_list}")
                     return keyword_list, important_tks
                 else:
-                    logger.warning(f"LLM returned empty keywords for {context}, falling back to tokenization")
+                    logger.warning(f"[关键词生成] LLM返回空关键词: context={context}，回退到分词方法")
             except Exception as e:
-                logger.warning(f"Failed to generate keywords with LLM for {context}: {e}, falling back to tokenization")
+                logger.warning(f"[关键词生成] LLM生成关键词失败: context={context}, 错误: {e}，回退到分词方法", exc_info=True)
+        else:
+            logger.debug(f"[关键词生成] LLM模型未初始化，使用分词方法: context={context}")
         
         # 回退到原来的分词方法
         tokenized_text = rag_tokenizer.tokenize(content)
         important_tks = rag_tokenizer.fine_grained_tokenize(tokenized_text)
+        logger.debug(f"[关键词生成] 使用分词方法生成关键词: context={context}, tokenized_text={tokenized_text[:50]}...")
         return [tokenized_text], important_tks
     
     def get_cache_stats(self) -> Dict[str, Any]:
@@ -154,19 +219,216 @@ class CustomPdfParser:
         """
         self._keyword_cache.clear()
         logger.info("Keyword cache cleared")
+    
+    def _init_ocr_config(self):
+        """初始化OCR配置，优先级：环境变量 > 配置文件 > custom_config"""
+        try:
+            # 从环境变量读取
+            app_id = os.getenv('TEXTIN_OCR_APP_ID')
+            secret_code = os.getenv('TEXTIN_OCR_SECRET_CODE')
+            
+            # 如果环境变量没有，从配置文件读取
+            if not app_id or not secret_code:
+                try:
+                    config = read_config('service_conf.yaml')
+                    ocr_config = config.get('ocr', {})
+                    app_id = app_id or ocr_config.get('app_id')
+                    secret_code = secret_code or ocr_config.get('secret_code')
+                except Exception as e:
+                    logger.debug(f"Failed to read OCR config from service_conf.yaml: {e}")
+            
+            # 如果还没有，从custom_config读取（向后兼容）
+            if not app_id:
+                app_id = self.custom_config.get('ocr_app_id')
+            if not secret_code:
+                secret_code = self.custom_config.get('ocr_secret_code')
+            
+            # 获取API URL
+            api_url = self.custom_config.get('ocr_api_url', "https://api.textin.com/ai/service/v1/pdf_to_markdown")
+            
+            # 如果配置了app_id和secret_code，创建OCR客户端
+            if app_id and secret_code:
+                self.ocr_client = OCRClient(app_id, secret_code, api_url)
+                logger.info("OCR client initialized successfully")
+            else:
+                logger.warning("OCR app_id or secret_code not configured, PDF parsing will be disabled")
+                self.ocr_client = None
+        except Exception as e:
+            logger.warning(f"Failed to initialize OCR config: {e}")
+            self.ocr_client = None
+    
+    def _calculate_pdf_md5(self, binary: bytes) -> str:
+        """计算PDF的MD5值"""
+        return hashlib.md5(binary).hexdigest()
+    
+    def _get_cached_json(self, md5: str) -> Optional[bytes]:
+        """从minio获取缓存的JSON"""
+        try:
+            cache_key = f"{md5}.json"
+            logger.debug(f"[缓存] 检查JSON缓存: bucket={self.json_cache_bucket}, key={cache_key}")
+            
+            if STORAGE_IMPL.obj_exist(self.json_cache_bucket, cache_key):
+                json_binary = STORAGE_IMPL.get(self.json_cache_bucket, cache_key)
+                logger.info(f"[缓存] ✓ JSON缓存命中: MD5={md5}, JSON大小={len(json_binary)} bytes")
+                return json_binary
+            else:
+                logger.debug(f"[缓存] ✗ JSON缓存未命中: MD5={md5}")
+        except Exception as e:
+            logger.warning(f"[缓存] 获取JSON缓存失败: MD5={md5}, 错误: {e}", exc_info=True)
+        return None
+    
+    def _save_to_cache(self, md5: str, pdf_binary: bytes, json_binary: bytes):
+        """保存PDF和JSON到minio（分开bucket）"""
+        try:
+            # 保存PDF到pdf-cache bucket
+            pdf_key = f"{md5}.pdf"
+            logger.debug(f"[缓存] 保存PDF到缓存: bucket={self.pdf_cache_bucket}, key={pdf_key}, 大小={len(pdf_binary)} bytes")
+            STORAGE_IMPL.put(self.pdf_cache_bucket, pdf_key, pdf_binary)
+            logger.info(f"[缓存] ✓ PDF保存成功: {self.pdf_cache_bucket}/{pdf_key}")
+            
+            # 保存JSON到json-cache bucket
+            json_key = f"{md5}.json"
+            logger.debug(f"[缓存] 保存JSON到缓存: bucket={self.json_cache_bucket}, key={json_key}, 大小={len(json_binary)} bytes")
+            STORAGE_IMPL.put(self.json_cache_bucket, json_key, json_binary)
+            logger.info(f"[缓存] ✓ JSON保存成功: {self.json_cache_bucket}/{json_key}")
+        except Exception as e:
+            logger.error(f"[缓存] 保存缓存失败: MD5={md5}, 错误: {e}", exc_info=True)
+            # 不抛出异常，允许继续处理
+    
+    def _call_ocr_api(self, pdf_binary: bytes) -> bytes:
+        """调用OCR API解析PDF"""
+        if not self.ocr_client:
+            raise ValueError("OCR client not initialized. Please configure TEXTIN_OCR_APP_ID and TEXTIN_OCR_SECRET_CODE")
+        
+        logger.info(f"[OCR API] 调用OCR API解析PDF，文件大小: {len(pdf_binary)} bytes, API URL: {self.ocr_client.api_url}")
+        import time
+        ocr_start = time.time()
+        
+        try:
+            response_text = self.ocr_client.recognize(pdf_binary)
+            ocr_duration = time.time() - ocr_start
+            logger.info(f"[OCR API] OCR API调用成功，耗时: {ocr_duration:.2f}秒，响应大小: {len(response_text)} bytes")
+            
+            # 解析响应，提取result字段
+            json_response = json.loads(response_text)
+            if "result" in json_response:
+                result_json = json.dumps(json_response["result"], ensure_ascii=False).encode('utf-8')
+                logger.info(f"[OCR API] 提取result字段成功，result大小: {len(result_json)} bytes")
+                return result_json
+            else:
+                logger.error(f"[OCR API] OCR API响应缺少'result'字段，响应键: {list(json_response.keys())}")
+                raise ValueError("OCR API response missing 'result' field")
+        except requests.exceptions.RequestException as e:
+            ocr_duration = time.time() - ocr_start
+            logger.error(f"[OCR API] OCR API调用失败（网络错误），耗时: {ocr_duration:.2f}秒，错误: {str(e)}", exc_info=True)
+            raise
+        except Exception as e:
+            ocr_duration = time.time() - ocr_start
+            logger.error(f"[OCR API] OCR API调用失败，耗时: {ocr_duration:.2f}秒，错误: {str(e)}", exc_info=True)
+            raise
+    
+    def _convert_textin_position_to_ragflow(self, position: List[int], page_id: int) -> List[int]:
+        """
+        将Textin的8个角点坐标转换为RAGFlow的5个数字格式
+        
+        Textin格式: [左上x, 左上y, 右上x, 右上y, 右下x, 右下y, 左下x, 左下y]
+        RAGFlow格式: [page_id, left, right, top, bottom] (与add_positions和Infinity对齐)
+        
+        Args:
+            position: Textin的position数组（8个数字）
+            page_id: 页码（从1开始）
+        
+        Returns:
+            RAGFlow格式的position数组（5个数字）：[page_id, left, right, top, bottom]
+        """
+        if not position or len(position) < 8:
+            logger.debug(f"[位置转换] 位置信息不完整，使用默认值: page_id={page_id}, position长度={len(position) if position else 0}")
+            return [page_id, 0, 0, 0, 0]
+        
+        # 提取4个角点坐标
+        top_left_x, top_left_y = position[0], position[1]
+        top_right_x, top_right_y = position[2], position[3]
+        bottom_right_x, bottom_right_y = position[4], position[5]
+        bottom_left_x, bottom_left_y = position[6], position[7]
+        
+        # 计算边界框（与add_positions和Infinity格式对齐）
+        left = min(top_left_x, bottom_left_x)  # 左边界
+        right = max(top_right_x, bottom_right_x)  # 右边界
+        top = min(top_left_y, top_right_y)  # 上边界
+        bottom = max(bottom_left_y, bottom_right_y)  # 下边界
+        
+        ragflow_position = [page_id, int(left), int(right), int(top), int(bottom)]
+        logger.debug(f"[位置转换] Textin位置 {position[:4]}... -> RAGFlow位置 {ragflow_position}")
+        return ragflow_position
         
     def parse(self, filename: str, binary: bytes, from_page: int = 0, to_page: int = 100000, **kwargs) -> List[Dict[str, Any]]:
         """
-        自定义解析逻辑 - 仅支持JSON文件
+        自定义解析逻辑 - 支持PDF和JSON文件
         """
-        logger.info(f"Custom parser processing: {filename}")
+        logger.info(f"[解析入口] Custom parser开始处理文件: {filename}, 文件大小: {len(binary)} bytes")
         
         # 检查文件类型
-        if filename.lower().endswith('.json'):
+        file_ext = os.path.splitext(filename)[1].lower()
+        logger.info(f"[解析入口] 文件类型: {file_ext}")
+        
+        if filename.lower().endswith('.pdf'):
+            logger.info(f"[解析入口] 识别为PDF文件，调用PDF解析流程")
+            return self._parse_pdf_file(filename, binary, **kwargs)
+        elif filename.lower().endswith('.json'):
+            logger.info(f"[解析入口] 识别为JSON文件，调用JSON解析流程")
             return self._parse_json_file(filename, binary, **kwargs)
         else:
-            # 对于非JSON文件，返回空列表
-            logger.warning(f"Custom parser only supports JSON files, got: {filename}")
+            # 对于不支持的文件类型，返回空列表
+            logger.warning(f"[解析入口] Custom parser仅支持PDF和JSON文件，当前文件: {filename} (扩展名: {file_ext})")
+            return []
+    
+    def _parse_pdf_file(self, filename: str, binary: bytes, **kwargs) -> List[Dict[str, Any]]:
+        """
+        解析PDF文件 - 使用OCR API或缓存
+        """
+        try:
+            logger.info(f"[PDF解析] 开始解析PDF文件: {filename}, 文件大小: {len(binary)} bytes")
+            
+            # 1. 计算PDF的MD5值
+            md5 = self._calculate_pdf_md5(binary)
+            logger.info(f"[PDF解析] PDF文件MD5: {md5}")
+            
+            # 2. 检查缓存
+            logger.info(f"[PDF解析] 检查缓存 (bucket: {self.json_cache_bucket}, key: {md5}.json)")
+            cached_json = self._get_cached_json(md5)
+            if cached_json:
+                logger.info(f"[PDF解析] ✓ 缓存命中，使用缓存的JSON: {filename} (MD5: {md5}), JSON大小: {len(cached_json)} bytes")
+                chunks = self._parse_json_file(filename, cached_json, **kwargs)
+                logger.info(f"[PDF解析] 缓存JSON解析完成，生成 {len(chunks)} 个chunks")
+                return chunks
+            
+            logger.info(f"[PDF解析] ✗ 缓存未命中，需要调用OCR API")
+            
+            # 3. 调用OCR API
+            if not self.ocr_client:
+                logger.error(f"[PDF解析] OCR客户端未初始化，无法解析PDF: {filename}")
+                return []
+            
+            logger.info(f"[PDF解析] 调用OCR API解析PDF: {filename} (MD5: {md5})")
+            import time
+            ocr_start_time = time.time()
+            json_binary = self._call_ocr_api(binary)
+            ocr_duration = time.time() - ocr_start_time
+            logger.info(f"[PDF解析] OCR API调用完成，耗时: {ocr_duration:.2f}秒，返回JSON大小: {len(json_binary)} bytes")
+            
+            # 4. 保存到缓存
+            logger.info(f"[PDF解析] 保存PDF和JSON到缓存 (PDF bucket: {self.pdf_cache_bucket}, JSON bucket: {self.json_cache_bucket})")
+            self._save_to_cache(md5, binary, json_binary)
+            logger.info(f"[PDF解析] ✓ 缓存保存完成")
+            
+            # 5. 解析JSON
+            logger.info(f"[PDF解析] 开始解析OCR返回的JSON")
+            chunks = self._parse_json_file(filename, json_binary, **kwargs)
+            logger.info(f"[PDF解析] PDF解析完成: {filename}, 生成 {len(chunks)} 个chunks")
+            return chunks
+            
+        except Exception as e:
+            logger.error(f"[PDF解析] PDF文件解析失败: {filename}, 错误: {str(e)}", exc_info=True)
             return []
     
     def _parse_json_file(self, filename: str, binary: bytes, **kwargs) -> List[Dict[str, Any]]:
@@ -174,40 +436,55 @@ class CustomPdfParser:
         解析JSON格式文件（基于Textin格式）
         """
         try:
+            logger.info(f"[JSON解析] 开始解析JSON文件: {filename}, JSON大小: {len(binary)} bytes")
+            
             # 解析JSON数据
             json_data = json.loads(binary.decode('utf-8'))
+            logger.info(f"[JSON解析] JSON解析成功，根对象类型: {type(json_data).__name__}")
             
             # 重置章节状态
             self.title_hierarchy = []
             self.current_hierarchy = []
+            logger.info(f"[JSON解析] 章节层级状态已重置")
             
             # 检查JSON格式
             if not isinstance(json_data, dict) or 'detail' not in json_data:
-                logger.warning(f"JSON文件 {filename} 格式不正确，缺少detail字段")
+                logger.warning(f"[JSON解析] JSON文件 {filename} 格式不正确，缺少detail字段")
                 return []
             
             if not isinstance(json_data['detail'], list):
-                logger.warning(f"JSON文件 {filename} 的detail字段不是列表类型")
+                logger.warning(f"[JSON解析] JSON文件 {filename} 的detail字段不是列表类型，实际类型: {type(json_data['detail']).__name__}")
                 return []
+            
+            detail_count = len(json_data['detail'])
+            logger.info(f"[JSON解析] detail数组包含 {detail_count} 个数据项")
             
             # 处理所有数据项
             chunks = []
-            for item in json_data['detail']:
+            processed_count = 0
+            skipped_count = 0
+            
+            for idx, item in enumerate(json_data['detail']):
                 if not isinstance(item, dict):
+                    skipped_count += 1
+                    logger.debug(f"[JSON解析] 跳过第 {idx+1} 项（非字典类型）")
                     continue
                 
                 chunk = self._process_json_item(item, filename)
                 if chunk:
-                        chunks.append(chunk)
+                    chunks.append(chunk)
+                    processed_count += 1
+                else:
+                    skipped_count += 1
             
-            logger.info(f"JSON文件 {filename} 解析完成，生成 {len(chunks)} 个chunks")
+            logger.info(f"[JSON解析] JSON文件 {filename} 解析完成: 处理 {processed_count} 项，跳过 {skipped_count} 项，生成 {len(chunks)} 个chunks")
             return chunks
             
         except json.JSONDecodeError as e:
-            logger.error(f"JSON文件 {filename} 解析失败: {str(e)}")
+            logger.error(f"[JSON解析] JSON文件 {filename} 解析失败（JSON格式错误）: {str(e)}", exc_info=True)
             return []
         except Exception as e:
-            logger.error(f"处理JSON文件 {filename} 时发生错误: {str(e)}")
+            logger.error(f"[JSON解析] 处理JSON文件 {filename} 时发生错误: {str(e)}", exc_info=True)
             return []
     
     
@@ -217,15 +494,26 @@ class CustomPdfParser:
         """
         # 支持两种字段名：type 和 sub_type
         item_type = item.get('type', '') or item.get('sub_type', '')
+        page_id = item.get('page_id', 'N/A')
+        sub_type = item.get('sub_type', 'N/A')
+        
+        logger.debug(f"[JSON项处理] 处理项: type={item_type}, sub_type={sub_type}, page_id={page_id}")
         
         if item_type in ['paragraph', 'text', 'text_title']:
-            return self._process_paragraph_item(item, filename)
+            chunk = self._process_paragraph_item(item, filename)
+            if chunk:
+                logger.debug(f"[JSON项处理] ✓ 段落项处理成功: page_id={page_id}, sub_type={sub_type}")
+            return chunk
         elif item_type == 'table':
-            return self._process_table_item(item, filename)
+            chunk = self._process_table_item(item, filename)
+            if chunk:
+                logger.debug(f"[JSON项处理] ✓ 表格项处理成功: page_id={page_id}")
+            return chunk
         # elif item_type == 'image':
         #     return self._process_image_item(item, filename)
         else:
             # 其他类型暂时跳过
+            logger.debug(f"[JSON项处理] ✗ 跳过未支持的类型: type={item_type}")
             return None
     
     def _create_base_doc(self, filename: str) -> Dict[str, Any]:
@@ -291,15 +579,20 @@ class CustomPdfParser:
         # 创建标题chunk
         chunk = doc.copy()
         
-        # 添加位置信息
-        position = item.get('position', [])
-        if position and len(position) >= 4:
-            chunk["position_int"] = [position]
-            chunk["page_num_int"] = [item.get('page_id', 1)]
-            chunk["top_int"] = [position[2]]  # top position
+        # 添加位置信息（根据Textin格式转换）
+        page_id = item.get('page_id', 1)  # Textin的page_id从1开始
+        position = item.get('position', [])  # Textin的position是8个数字（4个角点）
+        
+        # 转换为RAGFlow格式
+        if position and len(position) >= 8:
+            ragflow_position = self._convert_textin_position_to_ragflow(position, page_id)
+            chunk["position_int"] = [ragflow_position]
+            chunk["page_num_int"] = [page_id]
+            chunk["top_int"] = [ragflow_position[3]]  # top坐标（格式：[page_id, left, right, top, bottom]）
         else:
-            chunk["position_int"] = [[item.get('page_id', 1), 0, 0, 0, 0]]
-            chunk["page_num_int"] = [item.get('page_id', 1)]
+            # 默认位置信息（格式：[page_id, left, right, top, bottom]）
+            chunk["position_int"] = [[page_id, 0, 0, 0, 0]]
+            chunk["page_num_int"] = [page_id]
             chunk["top_int"] = [0]
         
         chunk.update({
@@ -309,8 +602,7 @@ class CustomPdfParser:
         # 使用RAGFlow标准分词
         tokenize(chunk, title_text, False)  # 假设是中文文档
         
-        # 添加positions字段，避免API验证错误
-        add_positions(chunk, [[0, 0, 0, 0, 0]])  # 默认位置信息
+        # 位置信息已在上面设置，不需要再调用add_positions
         
         # 为章节标题添加重要关键词字段，提高检索权重
         #if title_text:
@@ -342,17 +634,20 @@ class CustomPdfParser:
         # 创建chunk，基于基础文档结构
         chunk = doc.copy()
         
-        # 添加位置信息
-        position = item.get('position', [])
-        if position and len(position) >= 4:
-            # 位置格式: [page_id, x, y, width, height]
-            chunk["position_int"] = [position]
-            chunk["page_num_int"] = [item.get('page_id', 1)]
-            chunk["top_int"] = [position[2]]  # top position
+        # 添加位置信息（根据Textin格式转换）
+        page_id = item.get('page_id', 1)  # Textin的page_id从1开始
+        position = item.get('position', [])  # Textin的position是8个数字（4个角点）
+        
+        # 转换为RAGFlow格式
+        if position and len(position) >= 8:
+            ragflow_position = self._convert_textin_position_to_ragflow(position, page_id)
+            chunk["position_int"] = [ragflow_position]
+            chunk["page_num_int"] = [page_id]
+            chunk["top_int"] = [ragflow_position[3]]  # top坐标（格式：[page_id, left, right, top, bottom]）
         else:
-            # 默认位置信息
-            chunk["position_int"] = [[item.get('page_id', 1), 0, 0, 0, 0]]
-            chunk["page_num_int"] = [item.get('page_id', 1)]
+            # 默认位置信息（格式：[page_id, left, right, top, bottom]）
+            chunk["position_int"] = [[page_id, 0, 0, 0, 0]]
+            chunk["page_num_int"] = [page_id]
             chunk["top_int"] = [0]
         
         # 构建包含章节标题的完整内容
@@ -370,8 +665,7 @@ class CustomPdfParser:
         # 使用RAGFlow标准分词 - 使用原始文本
         tokenize(chunk, text, False)  # 假设是中文文档
         
-        # 添加positions字段，避免API验证错误
-        add_positions(chunk, [[0, 0, 0, 0, 0]])  # 默认位置信息
+        # 位置信息已在上面设置，不需要再调用add_positions
         
         # 为包含章节标题的文本内容添加重要关键词字段
         if section_title:
@@ -417,15 +711,20 @@ class CustomPdfParser:
         # 创建chunk，基于基础文档结构
         chunk = doc.copy()
         
-        # 添加位置信息
-        position = item.get('position', [])
-        if position and len(position) >= 4:
-            chunk["position_int"] = [position]
-            chunk["page_num_int"] = [item.get('page_id', 1)]
-            chunk["top_int"] = [position[2]]  # top position
+        # 添加位置信息（根据Textin格式转换）
+        page_id = item.get('page_id', 1)  # Textin的page_id从1开始
+        position = item.get('position', [])  # Textin的position是8个数字（4个角点）
+        
+        # 转换为RAGFlow格式
+        if position and len(position) >= 8:
+            ragflow_position = self._convert_textin_position_to_ragflow(position, page_id)
+            chunk["position_int"] = [ragflow_position]
+            chunk["page_num_int"] = [page_id]
+            chunk["top_int"] = [ragflow_position[3]]  # top坐标（格式：[page_id, left, right, top, bottom]）
         else:
-            chunk["position_int"] = [[item.get('page_id', 1), 0, 0, 0, 0]]
-            chunk["page_num_int"] = [item.get('page_id', 1)]
+            # 默认位置信息（格式：[page_id, left, right, top, bottom]）
+            chunk["position_int"] = [[page_id, 0, 0, 0, 0]]
+            chunk["page_num_int"] = [page_id]
             chunk["top_int"] = [0]
         
         chunk.update({
@@ -435,8 +734,7 @@ class CustomPdfParser:
         # 使用RAGFlow标准分词
         tokenize(chunk, enhanced_content, False)  # 假设是中文文档
         
-        # 添加positions字段，避免API验证错误
-        add_positions(chunk, [[0, 0, 0, 0, 0]])  # 默认位置信息
+        # 位置信息已在上面设置，不需要再调用add_positions
         
         return chunk
     
@@ -446,9 +744,10 @@ class CustomPdfParser:
         理论上相同section_title的chunks应该合并在一起
         """
         if not chunks:
+            logger.info(f"[合并策略] 没有chunks需要合并: {filename}")
             return chunks
         
-        logger.info(f"Applying simple merge strategy to {len(chunks)} chunks")
+        logger.info(f"[合并策略] 开始应用合并策略: {filename}, 原始chunks数: {len(chunks)}")
         
         # 按section_title分组
         grouped_chunks = {}
@@ -463,13 +762,18 @@ class CustomPdfParser:
                     grouped_chunks[section_title] = []
                 grouped_chunks[section_title].append(chunk)
         
+        logger.info(f"[合并策略] 分组统计: 标题chunks={len(title_chunks)}, 文本分组数={len(grouped_chunks)}")
+        
         # 合并每个分组的chunks
         merged_chunks = []
         
         # 先添加标题chunks
         merged_chunks.extend(title_chunks)
+        logger.debug(f"[合并策略] 添加了 {len(title_chunks)} 个标题chunks")
         
         # 合并文本chunks
+        merged_count = 0
+        single_count = 0
         for section_title, text_chunks in grouped_chunks.items():
             if not text_chunks:
                 continue
@@ -481,13 +785,16 @@ class CustomPdfParser:
                     # 如果content_with_weight还没有包含标题，则添加
                     single_chunk['content_with_weight'] = f"[{section_title}]\n{single_chunk.get('content_with_weight', '')}"
                 merged_chunks.append(single_chunk)
+                single_count += 1
             else:
                 # 多个chunks，需要合并
+                logger.debug(f"[合并策略] 合并分组 '{section_title}': {len(text_chunks)} 个chunks")
                 merged_chunk = self._create_merged_chunk(text_chunks, section_title)
                 if merged_chunk:
                     merged_chunks.append(merged_chunk)
-            
-        logger.info(f"Simple merge strategy completed: {len(chunks)} -> {len(merged_chunks)} chunks")
+                    merged_count += 1
+        
+        logger.info(f"[合并策略] 合并完成: {filename}, {len(chunks)} -> {len(merged_chunks)} chunks (合并了 {merged_count} 个分组，保留 {single_count} 个单chunk分组)")
         return merged_chunks
     
     def _create_merged_chunk(self, text_chunks: List[Dict[str, Any]], section_title: str) -> Optional[Dict[str, Any]]:
@@ -661,7 +968,14 @@ def chunk(filename: str, binary: Optional[bytes] = None, from_page: int = 0, to_
         if "tenant_id" in kwargs:
             custom_config["tenant_id"] = kwargs["tenant_id"]
         
-        logger.info(f"Parser config: {parser_config}")
+        # 确保bucket配置使用连字符（如果custom_config中没有指定，使用默认值）
+        if "pdf_cache_bucket" not in custom_config:
+            custom_config["pdf_cache_bucket"] = "pdf-cache"
+        if "json_cache_bucket" not in custom_config:
+            custom_config["json_cache_bucket"] = "json-cache"
+        
+        logger.info(f"[解析器初始化] Parser config: {parser_config}")
+        logger.info(f"[解析器初始化] Custom config bucket设置: pdf_cache_bucket={custom_config.get('pdf_cache_bucket', 'pdf-cache')}, json_cache_bucket={custom_config.get('json_cache_bucket', 'json-cache')}")
         
         # 创建自定义解析器实例
         parser = CustomPdfParser(custom_config=custom_config)
