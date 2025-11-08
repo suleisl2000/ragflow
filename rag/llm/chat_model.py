@@ -140,7 +140,7 @@ class Base(ABC):
         return gen_conf
 
     def _chat(self, history, gen_conf, **kwargs):
-        logging.info("[HISTORY]" + json.dumps(history, ensure_ascii=False, indent=2))
+        logging.debug("[HISTORY]" + json.dumps(history, ensure_ascii=False, indent=2))
         if self.model_name.lower().find("qwq") >= 0:
             logging.info(f"[INFO] {self.model_name} detected as reasoning model, using _chat_streamly")
 
@@ -170,7 +170,7 @@ class Base(ABC):
         return ans, self.total_token_count(response)
 
     def _chat_streamly(self, history, gen_conf, **kwargs):
-        logging.info("[HISTORY STREAMLY]" + json.dumps(history, ensure_ascii=False, indent=4))
+        logging.debug("[HISTORY STREAMLY]" + json.dumps(history, ensure_ascii=False, indent=4))
         reasoning_start = False
 
         if kwargs.get("stop") or "stop" in gen_conf:
@@ -679,7 +679,7 @@ class ZhipuChat(Base):
         ans = ""
         tk_count = 0
         try:
-            logging.info(json.dumps(history, ensure_ascii=False, indent=2))
+            logging.debug(json.dumps(history, ensure_ascii=False, indent=2))
             response = self.client.chat.completions.create(model=self.model_name, messages=history, stream=True, **gen_conf)
             for resp in response:
                 if not resp.choices[0].delta.content:
@@ -1427,7 +1427,7 @@ class LiteLLMBase(ABC):
         return gen_conf
 
     def _chat(self, history, gen_conf, **kwargs):
-        logging.info("[HISTORY]" + json.dumps(history, ensure_ascii=False, indent=2))
+        logging.debug("[HISTORY]" + json.dumps(history, ensure_ascii=False, indent=2))
         if self.model_name.lower().find("qwen3") >= 0:
             kwargs["extra_body"] = {"enable_thinking": False}
 
@@ -1448,7 +1448,7 @@ class LiteLLMBase(ABC):
         return ans, self.total_token_count(response)
 
     def _chat_streamly(self, history, gen_conf, **kwargs):
-        logging.info("[HISTORY STREAMLY]" + json.dumps(history, ensure_ascii=False, indent=4))
+        logging.debug("[HISTORY STREAMLY]" + json.dumps(history, ensure_ascii=False, indent=4))
         reasoning_start = False
 
         completion_args = self._construct_completion_args(history=history, stream=True, tools=False, **gen_conf)
