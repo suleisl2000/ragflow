@@ -752,17 +752,21 @@ class CustomPdfParser:
         # 按section_title分组
         grouped_chunks = {}
         title_chunks = []
+        table_chunks = []  # 表格chunks单独处理，不参与合并
         
         for chunk in chunks:
             if chunk.get('doc_type_kwd') == 'title':
                 title_chunks.append(chunk)
+            elif chunk.get('doc_type_kwd') == 'table':
+                # 表格chunks单独处理，不参与合并
+                table_chunks.append(chunk)
             else:
                 section_title = chunk.get('section_title', '')
                 if section_title not in grouped_chunks:
                     grouped_chunks[section_title] = []
                 grouped_chunks[section_title].append(chunk)
         
-        logger.info(f"[合并策略] 分组统计: 标题chunks={len(title_chunks)}, 文本分组数={len(grouped_chunks)}")
+        logger.info(f"[合并策略] 分组统计: 标题chunks={len(title_chunks)}, 表格chunks={len(table_chunks)}, 文本分组数={len(grouped_chunks)}")
         
         # 合并每个分组的chunks
         merged_chunks = []
@@ -770,6 +774,10 @@ class CustomPdfParser:
         # 先添加标题chunks
         merged_chunks.extend(title_chunks)
         logger.debug(f"[合并策略] 添加了 {len(title_chunks)} 个标题chunks")
+        
+        # 添加表格chunks（每个表格单独一个chunk，不合并）
+        merged_chunks.extend(table_chunks)
+        logger.debug(f"[合并策略] 添加了 {len(table_chunks)} 个表格chunks（不合并）")
         
         # 合并文本chunks
         merged_count = 0
