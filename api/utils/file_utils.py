@@ -174,22 +174,29 @@ def thumbnail_img(filename, blob):
     filename = filename.lower()
     if re.match(r".*\.pdf$", filename):
         with sys.modules[LOCK_KEY_pdfplumber]:
-            pdf = pdfplumber.open(BytesIO(blob))
+            try:
+                pdf = pdfplumber.open(BytesIO(blob))
+                if not pdf.pages or len(pdf.pages) == 0:
+                    pdf.close()
+                    return None
 
-            buffered = BytesIO()
-            resolution = 32
-            img = None
-            for _ in range(10):
-                # https://github.com/jsvine/pdfplumber?tab=readme-ov-file#creating-a-pageimage-with-to_image
-                pdf.pages[0].to_image(resolution=resolution).annotated.save(buffered, format="png")
-                img = buffered.getvalue()
-                if len(img) >= 64000 and resolution >= 2:
-                    resolution = resolution / 2
-                    buffered = BytesIO()
-                else:
-                    break
-        pdf.close()
-        return img
+                buffered = BytesIO()
+                resolution = 32
+                img = None
+                for _ in range(10):
+                    # https://github.com/jsvine/pdfplumber?tab=readme-ov-file#creating-a-pageimage-with-to_image
+                    pdf.pages[0].to_image(resolution=resolution).annotated.save(buffered, format="png")
+                    img = buffered.getvalue()
+                    if len(img) >= 64000 and resolution >= 2:
+                        resolution = resolution / 2
+                        buffered = BytesIO()
+                    else:
+                        break
+                pdf.close()
+                return img
+            except Exception:
+                # PDF文件损坏或无法打开，返回None而不是抛出异常
+                return None
 
     elif re.match(r".*\.(jpg|jpeg|png|tif|gif|icon|ico|webp)$", filename):
         image = Image.open(BytesIO(blob))

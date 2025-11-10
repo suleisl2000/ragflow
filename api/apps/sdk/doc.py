@@ -739,12 +739,11 @@ def parse(tenant_id, dataset_id):
     success_count = 0
     for id in doc_list:
         doc = DocumentService.query(id=id, kb_id=dataset_id)
-        if not doc:
+        doc_list_result = list(doc) if doc else []
+        if not doc_list_result or len(doc_list_result) == 0:
             not_found.append(id)
             continue
-        if not doc:
-            return get_error_data_result(message=f"You don't own the document {id}.")
-        if 0.0 < doc[0].progress < 1.0:
+        if 0.0 < doc_list_result[0].progress < 1.0:
             return get_error_data_result("Can't parse document that is currently being processed")
         info = {"run": "1", "progress": 0, "progress_msg": "", "chunk_num": 0, "token_num": 0}
         DocumentService.update_by_id(id, info)

@@ -357,26 +357,30 @@ def queue_tasks(doc: dict, bucket: str, name: str, priority: int):
     parse_task_array = []
 
     if doc["type"] == FileType.PDF.value:
-        file_bin = STORAGE_IMPL.get(bucket, name)
-        do_layout = doc["parser_config"].get("layout_recognize", "DeepDOC")
-        pages = PdfParser.total_page_number(doc["name"], file_bin)
-        if pages is None:
-            pages = 0
-        page_size = doc["parser_config"].get("task_page_size") or 12
-        if doc["parser_id"] == "paper":
-            page_size = doc["parser_config"].get("task_page_size") or 22
-        if doc["parser_id"] in ["one", "knowledge_graph"] or do_layout != "DeepDOC" or doc["parser_config"].get("toc", True):
-            page_size = 10 ** 9
-        page_ranges = doc["parser_config"].get("pages") or [(1, 10 ** 5)]
-        for s, e in page_ranges:
-            s -= 1
-            s = max(0, s)
-            e = min(e - 1, pages)
-            for p in range(s, e, page_size):
-                task = new_task()
-                task["from_page"] = p
-                task["to_page"] = min(p + page_size, e)
-                parse_task_array.append(task)
+        # Custom parser不需要检查PDF页数，直接创建单个任务
+        if doc["parser_id"] == "custom":
+            parse_task_array.append(new_task())
+        else:
+            file_bin = STORAGE_IMPL.get(bucket, name)
+            do_layout = doc["parser_config"].get("layout_recognize", "DeepDOC")
+            pages = PdfParser.total_page_number(doc["name"], file_bin)
+            if pages is None:
+                pages = 0
+            page_size = doc["parser_config"].get("task_page_size") or 12
+            if doc["parser_id"] == "paper":
+                page_size = doc["parser_config"].get("task_page_size") or 22
+            if doc["parser_id"] in ["one", "knowledge_graph"] or do_layout != "DeepDOC" or doc["parser_config"].get("toc", True):
+                page_size = 10 ** 9
+            page_ranges = doc["parser_config"].get("pages") or [(1, 10 ** 5)]
+            for s, e in page_ranges:
+                s -= 1
+                s = max(0, s)
+                e = min(e - 1, pages)
+                for p in range(s, e, page_size):
+                    task = new_task()
+                    task["from_page"] = p
+                    task["to_page"] = min(p + page_size, e)
+                    parse_task_array.append(task)
 
     elif doc["parser_id"] == "table":
         file_bin = STORAGE_IMPL.get(bucket, name)
