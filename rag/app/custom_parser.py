@@ -1094,8 +1094,13 @@ class CustomPdfParser:
         if not content_lines:
             return None
         
-        # 过滤掉包含"参考文献"的标题层级
-        if title_hierarchy and any("参考文献" in title for title in title_hierarchy):
+        # 过滤掉包含"参考文献"的标题层级（支持简体字和繁体字）
+        if title_hierarchy:
+            # 检查标题中是否包含"参考文献"（简体或繁体）
+            # 去掉空格后比较，支持"參 考 文 献"、"参考文献"等格式
+            for title in title_hierarchy:
+                title_no_spaces = title.replace(' ', '').replace('　', '')
+                if '参考文献' in title_no_spaces or '參考文献' in title_no_spaces:
             return None
         
         # 创建基础文档结构
