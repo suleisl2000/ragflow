@@ -38,7 +38,13 @@ logger = logging.getLogger(__name__)
 
 # 标题模式列表（从 gen_title_report.py 复制）
 TITLE_PATTERNS = [
-    # 模式1: 第X章/节/条等（优先级0，最高）
+    # 模式0: 以1个或多个空格开头的markdown标题，或作为兜底匹配所有不匹配其他模式的标题（优先级0，与模式1同级）
+    (
+        r"^.+",
+        0,
+        None
+    ),
+    # 模式1: 第X章/节/条等（优先级0）
     (
         r"^第[零一二三四五六七八九十百千0-9]+(分?编|部分|篇|章|节|条)",
         0,
@@ -57,8 +63,13 @@ TITLE_PATTERNS = [
         None
     ),
     # 模式4: "数字+空格"、"数字+、"、"数字+."（优先级3）
+    # 注意：不能匹配数字x.x.x格式（由模式5-9处理）
+    # 注意：不能匹配"数字+空格+右括号"格式（由模式9处理）
+    # 匹配格式：数字+空格/点号/顿号+标题内容
+    # 负向前瞻：排除"数字+空格+1-3位数字"（短数字，如"2 10个"），但允许"数字+空格+4位数字"（年份，如"2 2019"）
+    # 支持的格式示例："3 局限性和未来的方向"、"2 2019 年更新共识的主要内容"、"1. 适应证"、"1、 病史"
     (
-        r"^([0-9]{1,2})(\s+|[、.．]\s*)(?![0-9])",
+        r"^([0-9]{1,2})(\s+|[、.．]\s*)(?![0-9]{1,3}(?![0-9])|[）)]|$)",
         3,
         None
     ),
@@ -86,26 +97,46 @@ TITLE_PATTERNS = [
         7,
         4
     ),
-    # 模式9: 数字（1）格式（优先级8，最低）
+    # 模式9: 数字（1）格式或数字+空格+右括号格式（优先级8）
+    # 支持: "（1）"、"(1)"、"1 ）"、"2 ）" 等格式
     (
-        r"^[（(]([0-9]{1,2})[）)]",
+        r"^(?:[（(]([0-9]{1,2})[）)]|([0-9]{1,2})\s+[）)])",
         8,
+        None
+    ),
+    # 模式10: "问题1"、"问题一"格式（优先级9）
+    # 支持: "问题1"、"问题一"、"问题2"、"问题二" 等格式
+    (
+        r"^问题([0-9]+|[零一二三四五六七八九十百千]+)",
+        9,
+        None
+    ),
+    # 模式11: "推荐意见1"、"推荐意见一"格式（优先级9，与模式10同级）
+    # 支持: "推荐意见1"、"推荐意见一"、"推荐意见2"、"推荐意见二" 等格式
+    # 注意：如果匹配了模式10，则不再匹配模式11
+    (
+        r"^推荐意见([0-9]+|[零一二三四五六七八九十百千]+)",
+        9,
         None
     ),
 ]
 
 # 常见的前言性标题（一级标题）
+# 包含简体字和繁体字版本
 PREFACE_TITLES = {
     '目次', '目录', '前言', '引言', '概述', '摘要', '参考文献', '参考文献：',
-    '附录', '致谢', '后记', '编写说明'
+    '參考文献', '參考文献：',  # 繁体字版本
+    '附录', '致谢', '后记', '编写说明', '展望',
+    '附錄', '致謝', '後記', '編寫說明', '展望',  # 繁体字版本
+    '【摘要】', '【Abstract】'  # 带方括号的格式
 }
 
 
 def not_bullet(line: str) -> bool:
     """判断是否不是有效的标题编号"""
+    # 只检查最基本的无效格式，严格按照模式匹配来判断
     patt = [
         r"^0$",  # 单独的0
-        r"^[0-9]+\s+[0-9~个只-]",  # 数字+空格+数字/单位
         r"^[0-9]+\.{2,}",  # 数字+多个点
     ]
     return any([re.match(p, line.strip()) for p in patt])
@@ -120,18 +151,43 @@ def get_title_pattern_info(title_text: str) -> tuple:
     
     Returns:
         (priority, dot_count) 元组，如果不匹配任何模式返回 (-1, None)
+        priority: 模式优先级（数字越小优先级越高）
+        dot_count: 点号数量（仅用于数字x.x格式，其他模式为None）
     """
+    # 保留前导空格（用于匹配模式0），只去掉尾随空格
+    content_with_leading_space = title_text.rstrip()
+    # 去掉所有前后空格（用于匹配其他模式）
     content = title_text.strip()
     
     # 如果是前言性标题，返回最高优先级（0）
-    if content in PREFACE_TITLES or content.rstrip('：:') in PREFACE_TITLES:
+    # 支持中间有空格的情况（去掉所有空格后比较）
+    content_no_spaces = content.replace(' ', '').replace('　', '')  # 去掉普通空格和全角空格
+    content_no_spaces_no_colon = content_no_spaces.rstrip('：:')
+    if (content in PREFACE_TITLES or 
+        content.rstrip('：:') in PREFACE_TITLES or
+        content_no_spaces in PREFACE_TITLES or
+        content_no_spaces_no_colon in PREFACE_TITLES):
         return (0, None)
     
-    # 检查是否匹配任何模式
-    for pattern, priority, dot_count in TITLE_PATTERNS:
+    # 先检查其他模式（不需要前导空格）
+    for pattern, priority, dot_count in TITLE_PATTERNS[1:]:
         match = re.match(pattern, content)
         if match and not not_bullet(content):
             return (priority, dot_count)
+    
+    # 如果没有匹配任何其他模式，检查是否匹配模式0
+    # 模式0匹配：1) 有前导空格的标题，或 2) 所有不匹配其他模式的标题（作为兜底）
+    pattern0, priority0, dot_count0 = TITLE_PATTERNS[0]
+    # 优先检查有前导空格的情况
+    if content_with_leading_space != content:  # 有前导空格
+        match0 = re.match(pattern0, content_with_leading_space)
+        if match0 and not not_bullet(content_with_leading_space):
+            return (priority0, dot_count0)
+    # 如果没有前导空格，但也不匹配其他模式，也返回模式0作为兜底
+    if content:
+        match0 = re.match(pattern0, content)
+        if match0 and not not_bullet(content):
+            return (priority0, dot_count0)
     
     # 如果没有匹配任何模式，返回-1
     return (-1, None)
@@ -151,6 +207,12 @@ def is_valid_title(title_text: str) -> bool:
 def adjust_title_levels(titles: list) -> list:
     """
     调整标题层级：完全按照标题模式优先级确定绝对Level，不考虑markdown层级
+    
+    Args:
+        titles: 标题列表，每个元素包含 'content', 'level', 'line', 'file'
+    
+    Returns:
+        调整后的标题列表
     """
     if not titles:
         return titles
@@ -167,12 +229,71 @@ def adjust_title_levels(titles: list) -> list:
         priority, dot_count = get_title_pattern_info(title['content'])
         title_infos.append((idx, title, priority, dot_count))
     
-    # 过滤掉没有匹配任何模式的标题（priority == -1）
+    # 过滤掉没有匹配任何模式的标题（priority < 0）
     valid_titles = [(idx, title, priority, dot_count) for idx, title, priority, dot_count in title_infos if priority >= 0]
     
     if not valid_titles:
         # 所有标题都没有匹配模式，保持原层级
         return adjusted_titles
+    
+    # 对于模式0，只保留紧挨在模式2（"一、"）之前的匹配标题
+    # 如果有多个"一、"标题，每个"一、"之前如果有匹配模式0的标题都要保留
+    # 但是"二、"或其他模式2之前的模式0不保留
+    pattern1_regex = TITLE_PATTERNS[1][0]  # 模式1的正则表达式
+    pattern2_regex = TITLE_PATTERNS[2][0]  # 模式2的正则表达式（"一、"、"二、"等）
+    
+    # 找到所有模式2（"一、"）的标题位置
+    keep_pattern0_indices = set()
+    for i, (idx, title, priority, dot_count) in enumerate(valid_titles):
+        if priority == 1:  # 模式2的优先级是1
+            # 检查是否是"一、"（匹配模式2的正则，且内容以"一、"开头）
+            title_content = title['content'].strip()
+            if re.match(pattern2_regex, title_content):
+                # 进一步检查是否以"一、"开头（而不是"二、"、"三、"等）
+                if title_content.startswith('一、') or title_content.startswith('一．'):
+                    # 检查它前面的标题是否是模式0
+                    if i > 0:
+                        prev_idx, prev_title, prev_priority, prev_dot_count = valid_titles[i - 1]
+                        # 如果前一个标题是模式0（优先级0且不匹配模式1）
+                        if prev_priority == 0 and not re.match(pattern1_regex, prev_title['content'].strip()):
+                            # 标记为保留
+                            keep_pattern0_indices.add(prev_idx)
+    
+    # 过滤掉所有未标记保留的模式0标题
+    # 注意：前言性标题（匹配PREFACE_TITLES的标题）应该保留，不应该被过滤
+    filtered_titles = []
+    for idx, title, priority, dot_count in valid_titles:
+        # 如果是模式0（优先级0且不匹配模式1）
+        if priority == 0 and not re.match(pattern1_regex, title['content'].strip()):
+            # 检查是否是前言性标题
+            content = title['content'].strip()
+            content_no_spaces = content.replace(' ', '').replace('　', '')
+            content_no_spaces_no_colon = content_no_spaces.rstrip('：:')
+            is_preface = (content in PREFACE_TITLES or 
+                         content.rstrip('：:') in PREFACE_TITLES or
+                         content_no_spaces in PREFACE_TITLES or
+                         content_no_spaces_no_colon in PREFACE_TITLES)
+            
+            # 如果是前言性标题，保留；否则只有当它被标记为保留时（即紧挨在"一、"之前），才保留
+            if not is_preface and idx not in keep_pattern0_indices:
+                continue
+        filtered_titles.append((idx, title, priority, dot_count))
+    valid_titles = filtered_titles
+    
+    # 检查模式0和模式1是否在同一Level（互斥检查）
+    # 注意：custom_parser.py不返回has_conflict，但保留检查逻辑以便将来使用
+    has_pattern0 = False
+    has_pattern1 = False
+    
+    for idx, title, priority, dot_count in valid_titles:
+        if priority == 0:
+            if re.match(pattern1_regex, title['content'].strip()):
+                has_pattern1 = True
+            else:
+                has_pattern0 = True
+    
+    # 如果同时存在模式0和模式1，则冲突（这里只做检查，不返回）
+    # has_conflict = has_pattern0 and has_pattern1
     
     # 创建 (priority, dot_count) 对，用于排序和映射
     priority_dot_pairs = set()
@@ -194,7 +315,10 @@ def adjust_title_levels(titles: list) -> list:
         if key in pair_to_level:
             title['level'] = pair_to_level[key]
     
-    return adjusted_titles
+    # 只返回过滤后的标题（从valid_titles中提取）
+    filtered_adjusted_titles = [title for idx, title, priority, dot_count in valid_titles]
+    
+    return filtered_adjusted_titles
 
 
 def extract_titles_from_markdown(markdown_content: str) -> list:
