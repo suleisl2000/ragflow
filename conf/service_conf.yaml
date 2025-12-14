@@ -30,19 +30,47 @@ redis:
   password: 'infini_rag_flow'
   host: 'localhost:6379'
 
+ocr:
+  # PaddleOCR 配置（默认使用）
+  paddleocr:
+    api_url: 'http://localhost:8080/layout-parsing'
+  # Textin OCR 配置（备选）
+  textin:
+    app_id: ''
+    secret_code: ''
+    api_url: 'https://api.textin.com/ai/service/v1/pdf_to_markdown'
+
+# 混合配置：LLM 使用 Tongyi-Qianwen，Embedding 使用 LocalAI
 user_default_llm:
-  factory: 'Tongyi-Qianwen'
+  factory: 'Tongyi-Qianwen'  # 默认工厂（如果模型未指定则使用此）
   api_key: 'sk-xxx'
   base_url: 'https://dashscope.aliyuncs.com/compatible-mode/v1'
   default_models:
     chat_model:
-      name: 'qwen-plus'
+      name: 'qwen3-8b'
       factory: 'Tongyi-Qianwen'
       api_key: 'sk-xxx'
       base_url: 'https://dashscope.aliyuncs.com/compatible-mode/v1'
     embedding_model:
-      name: 'text-embedding-v3'
-      factory: 'Tongyi-Qianwen'
-      api_key: 'sk-xxx'
-      base_url: 'https://dashscope.aliyuncs.com/compatible-mode/v1'
+      name: 'Qwen3-Embedding-8B'
+      factory: 'LocalAI'
+      api_key: 'empty'
+      base_url: 'http://localhost:8082'
+
+# 之前的 Tongyi-Qianwen 配置（已注释，需要时可以恢复）
+#user_default_llm:
+#  factory: 'Tongyi-Qianwen'
+#  api_key: 'sk-xxx'
+#  base_url: 'https://dashscope.aliyuncs.com/compatible-mode/v1'
+#  default_models:
+#    chat_model:
+#      name: 'qwen-plus'
+#      factory: 'Tongyi-Qianwen'
+#      api_key: 'sk-xxx'
+#      base_url: 'https://dashscope.aliyuncs.com/compatible-mode/v1'
+#    embedding_model:
+#      name: 'text-embedding-v3'
+#      factory: 'Tongyi-Qianwen'
+#      api_key: 'sk-xxx'
+#      base_url: 'https://dashscope.aliyuncs.com/compatible-mode/v1'
 
