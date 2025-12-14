@@ -50,9 +50,10 @@ TITLE_PATTERNS = [
         0,
         None
     ),
-    # 模式2: 一、二、三、（中文数字+顿号，优先级1）
+    # 模式2: 一、二、三、（中文数字+顿号/全角点号/空格，优先级1）
+    # 支持：一、 一． 一 （中文数字后跟顿号、全角点号或空格）
     (
-        r"^([零一二三四五六七八九十百千]+|[一二三四五六七八九十]+)[、．]",
+        r"^([零一二三四五六七八九十百千]+|[一二三四五六七八九十]+)([、．]|\s+)",
         1,
         None
     ),
@@ -249,8 +250,9 @@ def adjust_title_levels(titles: list) -> list:
             # 检查是否是"一、"（匹配模式2的正则，且内容以"一、"开头）
             title_content = title['content'].strip()
             if re.match(pattern2_regex, title_content):
-                # 进一步检查是否以"一、"开头（而不是"二、"、"三、"等）
-                if title_content.startswith('一、') or title_content.startswith('一．'):
+                # 进一步检查是否以"一、"、"一．"或"一 "开头（而不是"二、"、"三、"等）
+                if (title_content.startswith('一、') or title_content.startswith('一．') or 
+                    title_content.startswith('一 ')):
                     # 检查它前面的标题是否是模式0
                     if i > 0:
                         prev_idx, prev_title, prev_priority, prev_dot_count = valid_titles[i - 1]
@@ -1101,7 +1103,7 @@ class CustomPdfParser:
             for title in title_hierarchy:
                 title_no_spaces = title.replace(' ', '').replace('　', '')
                 if '参考文献' in title_no_spaces or '參考文献' in title_no_spaces:
-            return None
+                    return None
         
         # 创建基础文档结构
         doc = self._create_base_doc(filename)
