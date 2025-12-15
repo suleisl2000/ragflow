@@ -1431,7 +1431,7 @@ class LiteLLMBase(ABC):
         if self.model_name.lower().find("qwen3") >= 0:
             kwargs["extra_body"] = {"enable_thinking": False}
 
-        completion_args = self._construct_completion_args(history=history, stream=False, tools=False, **gen_conf)
+        completion_args = self._construct_completion_args(history=history, stream=False, tools=False, **gen_conf, **kwargs)
         response = litellm.completion(
             **completion_args,
             drop_params=True,
@@ -1607,7 +1607,10 @@ class LiteLLMBase(ABC):
                 for _ in range(self.max_rounds + 1):
                     logging.info(f"{self.tools=}")
 
-                    completion_args = self._construct_completion_args(history=history, stream=False, tools=True, **gen_conf)
+                    kwargs = {}
+                    if self.model_name.lower().find("qwen3") >= 0:
+                        kwargs["extra_body"] = {"enable_thinking": False}
+                    completion_args = self._construct_completion_args(history=history, stream=False, tools=True, **gen_conf, **kwargs)
                     response = litellm.completion(
                         **completion_args,
                         drop_params=True,
