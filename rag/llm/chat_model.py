@@ -141,13 +141,14 @@ class Base(ABC):
 
     def _chat(self, history, gen_conf, **kwargs):
         logging.debug("[HISTORY]" + json.dumps(history, ensure_ascii=False, indent=2))
+        # qwq 系列走流式逻辑
         if self.model_name.lower().find("qwq") >= 0:
             logging.info(f"[INFO] {self.model_name} detected as reasoning model, using _chat_streamly")
 
             final_ans = ""
             tol_token = 0
             for delta, tol in self._chat_streamly(history, gen_conf, with_reasoning=False, **kwargs):
-                if delta.startswith("<think>") or delta.endswith("</think>"):
+                if isinstance(delta, str) and (delta.startswith("<think>") or delta.endswith("</think>")):
                     continue
                 final_ans += delta
                 tol_token = tol
@@ -157,28 +158,95 @@ class Base(ABC):
 
             return final_ans.strip(), tol_token
 
+        # Qwen3 系列在非流式调用时显式关闭 thinking
+        # 使用华为云/Ascend-vLLM 的方法：通过 chat_template_kwargs 关闭思维链
+        # 参考：https://support.huaweicloud.com/bestpractice-modelarts/modelarts_llm_infer_5906029.html
         if self.model_name.lower().find("qwen3") >= 0:
-            kwargs["extra_body"] = {"enable_thinking": False}
+            kwargs["extra_body"] = {"chat_template_kwargs": {"enable_thinking": False}}
 
-        response = self.client.chat.completions.create(model=self.model_name, messages=history, **gen_conf, **kwargs)
+        # 记录调用耗时（其余详细日志不再输出，避免噪音）
+        start_time = time.time()
 
-        if not response.choices or not response.choices[0].message or not response.choices[0].message.content:
+        response = self.client.chat.completions.create(
+            model=self.model_name,
+            messages=history,
+            **gen_conf,
+            **kwargs,
+        )
+
+        duration = time.time() - start_time
+
+        if not response or not getattr(response, "choices", None) or not response.choices or not response.choices[0].message or not response.choices[0].message.content:
+            logging.info(
+                "[LLM_CALL_DONE][Base._chat] model=%s duration=%.3fs but got empty response",
+                self.model_name,
+                duration,
+            )
             return "", 0
+
         ans = response.choices[0].message.content.strip()
         if response.choices[0].finish_reason == "length":
             ans = self._length_stop(ans)
-        return ans, self.total_token_count(response)
+
+        total_tokens = self.total_token_count(response)
+        logging.info(
+            "[LLM_CALL_DONE][Base._chat] model=%s duration=%.3fs total_tokens=%s finish_reason=%s len(ans)=%d",
+            self.model_name,
+            duration,
+            total_tokens,
+            getattr(response.choices[0], "finish_reason", "N/A"),
+            len(ans),
+        )
+        return ans, total_tokens
 
     def _chat_streamly(self, history, gen_conf, **kwargs):
         logging.debug("[HISTORY STREAMLY]" + json.dumps(history, ensure_ascii=False, indent=4))
         reasoning_start = False
 
+        # 如需对 Qwen3 流式调用也关闭 thinking，可在这里设置 extra_body
+        # 使用华为云/Ascend-vLLM 的方法：通过 chat_template_kwargs 关闭思维链
+        # 参考：https://support.huaweicloud.com/bestpractice-modelarts/modelarts_llm_infer_5906029.html
+        if self.model_name.lower().find("qwen3") >= 0 and "extra_body" not in kwargs:
+            kwargs["extra_body"] = {"chat_template_kwargs": {"enable_thinking": False}}
+
+        # 仅记录耗时相关信息，其余详细参数日志不再输出
+        start_time = time.time()
+
         if kwargs.get("stop") or "stop" in gen_conf:
-            response = self.client.chat.completions.create(model=self.model_name, messages=history, stream=True, **gen_conf, stop=kwargs.get("stop"))
+            response = self.client.chat.completions.create(
+                model=self.model_name,
+                messages=history,
+                stream=True,
+                **gen_conf,
+                stop=kwargs.get("stop"),
+                **{k: v for k, v in kwargs.items() if k != "stop"},  # 传递其他 kwargs（包括 extra_body）
+            )
         else:
-            response = self.client.chat.completions.create(model=self.model_name, messages=history, stream=True, **gen_conf)
+            response = self.client.chat.completions.create(
+                model=self.model_name,
+                messages=history,
+                stream=True,
+                **gen_conf,
+                **kwargs,  # 传递 kwargs（包括 extra_body）
+            )
+
+        first_chunk_time = None
+        last_chunk_time = None
+        chunk_count = 0
+        total_content_len = 0
 
         for resp in response:
+            now = time.time()
+            if first_chunk_time is None:
+                first_chunk_time = now
+                logging.info(
+                    "[LLM_CALL_STREAM_FIRST_CHUNK][Base._chat_streamly] model=%s first_chunk_delay=%.3fs",
+                    self.model_name,
+                    first_chunk_time - start_time,
+                )
+            last_chunk_time = now
+            chunk_count += 1
+
             if not resp.choices:
                 continue
             if not resp.choices[0].delta.content:
@@ -202,7 +270,19 @@ class Base(ABC):
                     ans += LENGTH_NOTIFICATION_CN
                 else:
                     ans += LENGTH_NOTIFICATION_EN
+
+            total_content_len += len(ans or "")
             yield ans, tol
+
+        if first_chunk_time is not None and last_chunk_time is not None:
+            logging.info(
+                "[LLM_CALL_STREAM_DONE][Base._chat_streamly] model=%s total_duration=%.3fs first_chunk_delay=%.3fs chunks=%d total_content_len=%d",
+                self.model_name,
+                last_time := (last_chunk_time - start_time),
+                first_chunk_time - start_time,
+                chunk_count,
+                total_content_len,
+            )
 
     def _length_stop(self, ans):
         if is_chinese([ans]):
@@ -1427,17 +1507,33 @@ class LiteLLMBase(ABC):
         return gen_conf
 
     def _chat(self, history, gen_conf, **kwargs):
-        logging.debug("[HISTORY]" + json.dumps(history, ensure_ascii=False, indent=2))
+        start_time = time.time()
+        timestamp_start = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(start_time))
+
         if self.model_name.lower().find("qwen3") >= 0:
             kwargs["extra_body"] = {"enable_thinking": False}
 
         completion_args = self._construct_completion_args(history=history, stream=False, tools=False, **gen_conf, **kwargs)
+
+        call_start_time = time.time()
         response = litellm.completion(
             **completion_args,
             drop_params=True,
             timeout=self.timeout,
         )
-        # response = self.client.chat.completions.create(model=self.model_name, messages=history, **gen_conf, **kwargs)
+        call_end_time = time.time()
+        call_duration = call_end_time - call_start_time
+        timestamp_end = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(call_end_time))
+
+        # 仅保留与耗时相关的统计日志
+        total_duration = call_end_time - start_time
+        logging.debug(
+            "[LLM调用后] %s | 模型: %s | 调用耗时: %.3f秒 | 总耗时: %.3f秒",
+            timestamp_end,
+            self.model_name,
+            call_duration,
+            total_duration,
+        )
 
         if any([not response.choices, not response.choices[0].message, not response.choices[0].message.content]):
             return "", 0
@@ -1448,20 +1544,45 @@ class LiteLLMBase(ABC):
         return ans, self.total_token_count(response)
 
     def _chat_streamly(self, history, gen_conf, **kwargs):
-        logging.debug("[HISTORY STREAMLY]" + json.dumps(history, ensure_ascii=False, indent=4))
+        import time
+        start_time = time.time()
+        timestamp_start = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(start_time))
+
         reasoning_start = False
 
         completion_args = self._construct_completion_args(history=history, stream=True, tools=False, **gen_conf)
         stop = kwargs.get("stop")
         if stop:
             completion_args["stop"] = stop
+
+        call_start_time = time.time()
         response = litellm.completion(
             **completion_args,
             drop_params=True,
             timeout=self.timeout,
         )
+        call_end_time = time.time()
+        call_duration = call_end_time - call_start_time
+        timestamp_end = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(call_end_time))
 
+        # 仅保留与耗时相关的统计日志（连接建立耗时）
+        logging.debug(
+            "[LLM流式调用后] %s | 模型: %s | 连接建立耗时: %.3f秒",
+            timestamp_end,
+            self.model_name,
+            call_duration,
+        )
+        
+        chunk_count = 0
+        total_content_length = 0
+        first_chunk_time = None
+        last_chunk_time = None
+        
         for resp in response:
+            if first_chunk_time is None:
+                first_chunk_time = time.time()
+            last_chunk_time = time.time()
+            chunk_count += 1
             if not hasattr(resp, "choices") or not resp.choices:
                 continue
 
@@ -1478,6 +1599,7 @@ class LiteLLMBase(ABC):
             else:
                 reasoning_start = False
                 ans = delta.content
+                total_content_length += len(ans) if ans else 0
 
             tol = self.total_token_count(resp)
             if not tol:
@@ -1491,6 +1613,18 @@ class LiteLLMBase(ABC):
                     ans += LENGTH_NOTIFICATION_EN
 
             yield ans, tol
+        
+        # 流式调用结束后的日志
+        if last_chunk_time and first_chunk_time:
+            stream_duration = last_chunk_time - first_chunk_time
+            total_duration = last_chunk_time - start_time
+            timestamp_finish = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(last_chunk_time))
+            logging.info(f"[LLM流式调用完成] {timestamp_finish} | 模型: {self.model_name} | "
+                        f"接收chunks数: {chunk_count} | 总内容长度: {total_content_length}字符 | "
+                        f"流式传输耗时: {stream_duration:.3f}秒 | 总耗时: {total_duration:.3f}秒")
+            if chunk_count > 0:
+                avg_chunk_time = stream_duration / chunk_count
+                logging.info(f"[LLM流式调用完成] 平均每个chunk耗时: {avg_chunk_time:.3f}秒")
 
     def _length_stop(self, ans):
         if is_chinese([ans]):
