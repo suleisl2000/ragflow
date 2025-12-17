@@ -775,8 +775,15 @@ class CustomPdfParser:
             # 保存PDF到pdf-cache bucket（保持原有结构）
             pdf_key = f"{md5}.pdf"
             logger.debug(f"[缓存] 保存PDF到缓存: bucket={self.pdf_cache_bucket}, key={pdf_key}, 大小={len(pdf_binary)} bytes")
-            STORAGE_IMPL.put(self.pdf_cache_bucket, pdf_key, pdf_binary)
-            logger.info(f"[缓存] ✓ PDF保存成功: {self.pdf_cache_bucket}/{pdf_key}")
+            try:
+                result = STORAGE_IMPL.put(self.pdf_cache_bucket, pdf_key, pdf_binary)
+                if result:
+                    logger.info(f"[缓存] ✓ PDF保存成功: {self.pdf_cache_bucket}/{pdf_key}")
+                else:
+                    logger.warning(f"[缓存] ✗ PDF保存失败（返回False）: {self.pdf_cache_bucket}/{pdf_key}")
+            except Exception as e:
+                logger.exception(f"[缓存] ✗ PDF保存异常: {self.pdf_cache_bucket}/{pdf_key}, 错误: {e}")
+                raise
             
             bucket = self.result_cache_bucket
             
@@ -954,11 +961,17 @@ class CustomPdfParser:
             
             elif self.ocr_type == "paddleocr":
                 # PaddleOCR API 调用，需要获取完整响应以提取图片
-                # 先调用API获取完整响应
+                # 使用PaddleOCRClient的recognize方法，但需要获取完整响应
+                # 所以直接调用API而不是使用recognize方法
                 file_base64 = base64.b64encode(pdf_binary).decode('utf-8')
+                
+                # 判断文件类型：0=PDF, 1=图片（与paddle_ocr.py保持一致）
+                # 这里传入的是PDF二进制，所以fileType应该是0
+                file_type = 0
+                
                 payload = {
                     "file": file_base64,
-                    "fileType": 0,  # 0=PDF, 1=图片
+                    "fileType": file_type,  # 使用变量，与paddle_ocr.py保持一致
                     "visualize": True  # 获取图片数据
                 }
                 
@@ -1836,6 +1849,27 @@ def chunk(filename: str, binary: Optional[bytes] = None, from_page: int = 0, to_
     logger.info(f"Custom parser chunk function called for: {filename}")
     
     try:
+        # 如果binary为None，尝试从存储读取
+        if binary is None:
+            logger.warning(f"[解析入口] binary参数为None，尝试从存储读取文件: {filename}")
+            # 从kwargs中获取kb_id，用于从存储读取文件
+            kb_id = kwargs.get("kb_id")
+            if kb_id:
+                try:
+                    from rag.utils.storage_factory import STORAGE_IMPL
+                    binary = STORAGE_IMPL.get(kb_id, filename)
+                    if binary:
+                        logger.info(f"[解析入口] 从存储读取文件成功: {filename}, 大小: {len(binary)} bytes")
+                    else:
+                        logger.error(f"[解析入口] 从存储读取文件失败: {filename} (返回None)")
+                        return []
+                except Exception as e:
+                    logger.exception(f"[解析入口] 从存储读取文件异常: {filename}, 错误: {e}")
+                    return []
+            else:
+                logger.error(f"[解析入口] binary为None且无法从存储读取（缺少kb_id）: {filename}")
+                return []
+        
         # 获取解析配置
         parser_config = kwargs.get("parser_config", {})
         custom_config = parser_config.get("custom_config", {})

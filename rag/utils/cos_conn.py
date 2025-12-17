@@ -92,8 +92,11 @@ class RAGFlowCOS:
             # If there is a default bucket, use the default bucket
             actual_bucket = self.bucket if self.bucket else bucket
             # 规范化bucket名称（添加appid）
-            actual_bucket = self._normalize_bucket_name(actual_bucket)
-            return method(self, actual_bucket, *args, **kwargs)
+            normalized_bucket = self._normalize_bucket_name(actual_bucket)
+            # 记录规范化后的bucket名称
+            if normalized_bucket != actual_bucket:
+                logging.info(f"[COS] Bucket名称规范化: {actual_bucket} -> {normalized_bucket}")
+            return method(self, normalized_bucket, *args, **kwargs)
         return wrapper
     
     @staticmethod
@@ -131,25 +134,17 @@ class RAGFlowCOS:
     @use_default_bucket
     def bucket_exists(self, bucket):
         try:
-            logging.debug(f"head_bucket bucketname {bucket}")
             self.conn.head_bucket(Bucket=bucket)
-            exists = True
-        except (CosClientError, CosServiceError) as e:
-            # bucket不存在时返回False，不记录错误日志
-            if isinstance(e, CosServiceError):
-                error_code = e.get_error_code()
-                if error_code in ['NoSuchBucket', 'NoSuchResource']:
-                    exists = False
-                else:
-                    logging.warning(f"head_bucket error {bucket}: {error_code} - {e.get_error_msg()}")
-                    exists = False
-            else:
-                logging.warning(f"head_bucket error {bucket}: {str(e)}")
-                exists = False
-        except Exception as e:
-            logging.warning(f"head_bucket error {bucket}: {str(e)}")
-            exists = False
-        return exists
+            return True
+        except CosServiceError as e:
+            error_code = e.get_error_code()
+            if error_code in ['NoSuchBucket', 'NoSuchResource']:
+                return False
+            # 其他错误也返回False，不记录日志（正常情况）
+            return False
+        except Exception:
+            # 异常情况返回False，不记录日志
+            return False
 
     def health(self, bucket=None):
         """
@@ -200,51 +195,60 @@ class RAGFlowCOS:
     @use_prefix_path
     @use_default_bucket
     def put(self, bucket, fnm, binary):
-        logging.debug(f"bucket name {bucket}; filename :{fnm}:")
         max_retries = 3
         for retry in range(max_retries):
             try:
+                # 先检查bucket是否存在，不存在则创建
                 if not self.bucket_exists(bucket):
                     try:
                         self.conn.create_bucket(Bucket=bucket)
                         logging.info(f"create bucket {bucket} ********")
-                        # COS创建bucket后可能需要等待一段时间才能使用（最终一致性）
-                        # 等待并重试bucket_exists确认bucket已创建
-                        for wait_retry in range(5):
-                            time.sleep(0.5)  # 等待0.5秒
-                            if self.bucket_exists(bucket):
-                                break
-                            if wait_retry == 4:
-                                logging.warning(f"Bucket {bucket} created but not immediately available, will retry put operation")
                     except CosServiceError as e:
-                        # 如果bucket已存在，忽略错误
+                        # 如果bucket已存在，忽略错误（可能其他进程已创建）
                         if e.get_error_code() not in ['BucketAlreadyExists', 'BucketAlreadyOwnedByYou']:
                             logging.exception(f"Fail to create bucket {bucket}")
-                    except Exception:
-                        logging.exception(f"Fail to create bucket {bucket}")
+                    
+                    # COS创建bucket后需要等待一段时间才能使用（最终一致性）
+                    # 检查bucket是否存在，最多3次，每次等待3秒
+                    bucket_ready = False
+                    for check_retry in range(3):
+                        time.sleep(3)
+                        if self.bucket_exists(bucket):
+                            bucket_ready = True
+                            break
+                    
+                    # 如果3次检查后bucket还不存在，再尝试create_bucket一次
+                    if not bucket_ready:
+                        try:
+                            self.conn.create_bucket(Bucket=bucket)
+                            logging.info(f"retry create bucket {bucket} ********")
+                            time.sleep(3)
+                        except CosServiceError as e:
+                            # 如果bucket已存在，说明bucket已经可用了
+                            if e.get_error_code() in ['BucketAlreadyExists', 'BucketAlreadyOwnedByYou']:
+                                pass
+                            else:
+                                logging.exception(f"Fail to retry create bucket {bucket}")
                 
-                self.conn.put_object(
-                    Bucket=bucket,
-                    Body=binary,
-                    Key=fnm
-                )
+                # 执行put_object（bucket已经通过装饰器规范化）
+                self.conn.put_object(Bucket=bucket, Body=binary, Key=fnm)
+                logging.info(f"[COS] put object成功: bucket={bucket}, key={fnm}, size={len(binary)} bytes")
                 return True
             except CosServiceError as e:
                 error_code = e.get_error_code()
                 if error_code == 'NoSuchBucket' and retry < max_retries - 1:
                     # bucket不存在，可能是刚创建还未生效，等待后重试
-                    logging.warning(f"Bucket {bucket} not available yet, retrying... (attempt {retry + 1}/{max_retries})")
-                    time.sleep(1)
+                    time.sleep(3)
                     continue
                 else:
-                    logging.exception(f"Fail put {bucket}/{fnm}: {error_code} - {e.get_error_msg()}")
-                    if retry < max_retries - 1:
-                        time.sleep(1)
-                        continue
+                    # 最后一次重试失败或其他错误，记录日志
+                    if retry == max_retries - 1:
+                        logging.exception(f"Fail put {bucket}/{fnm}: {error_code} - {e.get_error_msg()}")
                     return False
             except Exception as e:
-                logging.exception(f"Fail put {bucket}/{fnm}")
-                if retry < max_retries - 1:
+                if retry == max_retries - 1:
+                    logging.exception(f"Fail put {bucket}/{fnm}")
+                elif retry < max_retries - 1:
                     self.__open__()
                     time.sleep(1)
                     continue
@@ -257,11 +261,8 @@ class RAGFlowCOS:
         try:
             self.conn.delete_object(Bucket=bucket, Key=fnm)
         except CosServiceError as e:
-            # 如果资源不存在，认为删除成功（幂等性）
-            if e.get_error_code() in ['NoSuchResource', 'NoSuchKey', '404']:
-                logging.debug(f"Object {bucket}/{fnm} does not exist, consider deletion successful")
-                return
-            else:
+            # 如果资源不存在，认为删除成功（幂等性），不记录日志
+            if e.get_error_code() not in ['NoSuchResource', 'NoSuchKey', '404']:
                 logging.exception(f"Fail rm {bucket}/{fnm}")
         except Exception:
             logging.exception(f"Fail rm {bucket}/{fnm}")
@@ -273,24 +274,33 @@ class RAGFlowCOS:
         for retry in range(max_retries):
             try:
                 response = self.conn.get_object(Bucket=bucket, Key=fnm)
-                object_data = response['Body'].read()
+                # 使用get_raw_stream()获取原始二进制流，确保返回bytes类型（二进制数据）
+                # 直接read()可能返回文本，get_raw_stream().read()返回二进制
+                body_stream = response['Body'].get_raw_stream()
+                object_data = body_stream.read()
+                # 确保返回的是bytes类型（二进制数据）
+                if not isinstance(object_data, bytes):
+                    # 如果不是bytes，尝试转换
+                    if isinstance(object_data, str):
+                        object_data = object_data.encode('latin-1')  # 使用latin-1保持二进制完整性
+                    else:
+                        object_data = bytes(object_data)
                 return object_data
             except CosServiceError as e:
                 error_code = e.get_error_code()
                 if error_code == 'NoSuchBucket' and retry < max_retries - 1:
                     # bucket不存在，可能是刚创建还未生效，等待后重试
-                    logging.warning(f"Bucket {bucket} not available yet, retrying... (attempt {retry + 1}/{max_retries})")
-                    time.sleep(1)
+                    time.sleep(2)
                     continue
                 else:
-                    logging.exception(f"fail get {bucket}/{fnm}: {error_code} - {e.get_error_msg()}")
-                    if retry < max_retries - 1:
-                        time.sleep(1)
-                        continue
+                    # 最后一次重试失败或其他错误，记录日志
+                    if retry == max_retries - 1:
+                        logging.exception(f"fail get {bucket}/{fnm}: {error_code} - {e.get_error_msg()}")
                     return None
             except Exception as e:
-                logging.exception(f"fail get {bucket}/{fnm}")
-                if retry < max_retries - 1:
+                if retry == max_retries - 1:
+                    logging.exception(f"fail get {bucket}/{fnm}")
+                elif retry < max_retries - 1:
                     self.__open__()
                     time.sleep(1)
                     continue
@@ -304,17 +314,14 @@ class RAGFlowCOS:
             self.conn.head_object(Bucket=bucket, Key=fnm)
             return True
         except CosServiceError as e:
-            # 文件不存在时返回False，不抛出异常
+            # 文件不存在时返回False，不记录日志（正常情况）
             error_code = e.get_error_code()
             if error_code in ['NoSuchKey', 'NoSuchResource', '404']:
                 return False
-            else:
-                # 其他错误记录日志但不抛出异常，返回False
-                logging.warning(f"obj_exist error {bucket}/{fnm}: {error_code} - {e.get_error_msg()}")
-                return False
-        except Exception as e:
-            # 捕获所有其他异常，记录日志但不抛出，返回False
-            logging.exception(f"obj_exist error {bucket}/{fnm}")
+            # 其他错误也返回False，不记录日志
+            return False
+        except Exception:
+            # 异常情况返回False，不记录日志
             return False
 
     @use_prefix_path
@@ -333,3 +340,4 @@ class RAGFlowCOS:
                 self.__open__()
                 time.sleep(1)
         return
+
