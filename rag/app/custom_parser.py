@@ -23,16 +23,23 @@ import hashlib
 import requests
 import base64
 import tempfile
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 from collections import Counter
 from pathlib import Path
+from io import BytesIO
+try:
+    from PIL import Image
+    PIL_AVAILABLE = True
+except ImportError:
+    PIL_AVAILABLE = False
+    logger.warning("PIL/Pillow not available, image saving will be disabled")
 
 from rag.nlp import rag_tokenizer, tokenize, add_positions, tokenize_chunks, bullets_category, title_frequency
 from api.db import ParserType, LLMType
 from api.db.services.llm_service import LLMBundle         
 from rag.prompts.generator import keyword_extraction
 from rag.utils.storage_factory import STORAGE_IMPL
-from api.utils.configs import read_config
+from api.utils.configs import read_config, get_base_config
 
 logger = logging.getLogger(__name__)
 
@@ -465,8 +472,7 @@ class PaddleOCRClient:
             markdown_data = res.get("markdown", {})
             markdown_text = markdown_data.get("text", "")
             if markdown_text:
-                # 修正图片路径（如果需要）
-                markdown_text = markdown_text.replace('src="imgs/', 'src="images/imgs/')
+                # 图片路径保持原样：markdown/imgs/（不需要修正）
                 markdown_parts.append(markdown_text)
         
         # 拼接多页 markdown
@@ -505,17 +511,46 @@ class CustomPdfParser:
         self.ocr_client = None
         self._init_ocr_config()
         
-        # 缓存bucket配置（MinIO bucket名称不能包含下划线，使用连字符）
-        self.pdf_cache_bucket = self.custom_config.get("pdf_cache_bucket", "pdf-cache")
-        # 根据 OCR 类型自动选择结果缓存 bucket
+        # 缓存bucket配置初始化（支持环境变量和配置文件）
+        self._init_bucket_config()
+        logger.info(f"[解析器初始化] 缓存bucket配置: PDF={self.pdf_cache_bucket}, Result={self.result_cache_bucket} (OCR类型: {self.ocr_type})")
+    
+    def _init_bucket_config(self):
+        """初始化bucket配置，支持环境变量和配置文件"""
+        # 从环境变量或配置文件读取bucket配置
+        # 优先级：环境变量 > custom_config > 配置文件 > 默认值
+        
+        # PDF缓存bucket
+        self.pdf_cache_bucket = (
+            os.environ.get("PDF_CACHE_BUCKET") or
+            self.custom_config.get("pdf_cache_bucket") or
+            get_base_config("pdf_cache_bucket") or
+            "pdf-cache"
+        )
+        
+        # 根据OCR类型确定结果缓存bucket
         if self.ocr_type == "paddleocr":
-            self.result_cache_bucket = "paddleocr-cache"
+            self.result_cache_bucket = (
+                os.environ.get("PADDLEOCR_CACHE_BUCKET") or
+                self.custom_config.get("paddleocr_cache_bucket") or
+                get_base_config("paddleocr_cache_bucket") or
+                "paddleocr-cache"
+            )
         elif self.ocr_type == "textin":
-            self.result_cache_bucket = "textin-cache"
+            self.result_cache_bucket = (
+                os.environ.get("TEXTIN_CACHE_BUCKET") or
+                self.custom_config.get("textin_cache_bucket") or
+                get_base_config("textin_cache_bucket") or
+                "textin-cache"
+            )
         else:
             # 默认使用 textin-cache（向后兼容）
-            self.result_cache_bucket = "textin-cache"
-        logger.info(f"[解析器初始化] 缓存bucket配置: PDF={self.pdf_cache_bucket}, Result={self.result_cache_bucket} (OCR类型: {self.ocr_type})")
+            self.result_cache_bucket = (
+                os.environ.get("TEXTIN_CACHE_BUCKET") or
+                self.custom_config.get("textin_cache_bucket") or
+                get_base_config("textin_cache_bucket") or
+                "textin-cache"
+            )
     
     def _init_llm_model(self):
         """初始化LLM模型用于关键词生成"""
@@ -705,15 +740,14 @@ class CustomPdfParser:
         return hashlib.md5(binary).hexdigest()
     
     def _get_cached_result(self, md5: str) -> Optional[bytes]:
-        """从minio获取缓存的OCR结果（根据OCR类型自动选择bucket和扩展名）"""
+        """从对象存储获取缓存的OCR结果（按文档目录结构组织）"""
         try:
-            # 根据 OCR 类型确定扩展名和 bucket
+            bucket = self.result_cache_bucket
+            # 按文档目录结构：{md5}/markdown/{md5}.md 或 {md5}/json/{md5}.json
             if self.ocr_type == "paddleocr":
-                cache_key = f"{md5}.md"
-                bucket = self.result_cache_bucket
+                cache_key = f"{md5}/markdown/{md5}.md"
             else:
-                cache_key = f"{md5}.json"
-                bucket = self.result_cache_bucket
+                cache_key = f"{md5}/json/{md5}.json"
             
             logger.debug(f"[缓存] 检查OCR结果缓存: bucket={bucket}, key={cache_key}, OCR类型={self.ocr_type}")
             
@@ -727,33 +761,173 @@ class CustomPdfParser:
             logger.warning(f"[缓存] 获取OCR结果缓存失败: MD5={md5}, OCR类型={self.ocr_type}, 错误: {e}", exc_info=True)
         return None
     
-    def _save_to_cache(self, md5: str, pdf_binary: bytes, result_binary: bytes):
-        """保存PDF和OCR结果到minio（根据OCR类型自动选择bucket和扩展名）"""
+    def _save_to_cache(self, md5: str, pdf_binary: bytes, result_binary: bytes, full_response: Dict[str, Any] = None):
+        """
+        保存PDF和OCR结果到对象存储（按文档目录结构组织）
+        
+        Args:
+            md5: PDF文件的MD5值
+            pdf_binary: PDF文件二进制数据
+            result_binary: OCR结果的主要数据（markdown或json）
+            full_response: OCR API的完整响应（包含图片等数据）
+        """
         try:
-            # 保存PDF到pdf-cache bucket
+            # 保存PDF到pdf-cache bucket（保持原有结构）
             pdf_key = f"{md5}.pdf"
             logger.debug(f"[缓存] 保存PDF到缓存: bucket={self.pdf_cache_bucket}, key={pdf_key}, 大小={len(pdf_binary)} bytes")
             STORAGE_IMPL.put(self.pdf_cache_bucket, pdf_key, pdf_binary)
             logger.info(f"[缓存] ✓ PDF保存成功: {self.pdf_cache_bucket}/{pdf_key}")
             
-            # 根据 OCR 类型确定扩展名和 bucket
-            if self.ocr_type == "paddleocr":
-                result_key = f"{md5}.md"
-                result_type = "Markdown"
-            else:
-                result_key = f"{md5}.json"
-                result_type = "JSON"
+            bucket = self.result_cache_bucket
             
-            # 保存OCR结果到对应的bucket
-            logger.debug(f"[缓存] 保存{result_type}到缓存: bucket={self.result_cache_bucket}, key={result_key}, 大小={len(result_binary)} bytes, OCR类型={self.ocr_type}")
-            STORAGE_IMPL.put(self.result_cache_bucket, result_key, result_binary)
-            logger.info(f"[缓存] ✓ {result_type}保存成功: {self.result_cache_bucket}/{result_key}")
+            if self.ocr_type == "paddleocr":
+                # PaddleOCR: 保存markdown和图片
+                # 保存主markdown文件
+                md_key = f"{md5}/markdown/{md5}.md"
+                logger.debug(f"[缓存] 保存Markdown到缓存: bucket={bucket}, key={md_key}, 大小={len(result_binary)} bytes")
+                STORAGE_IMPL.put(bucket, md_key, result_binary)
+                logger.info(f"[缓存] ✓ Markdown保存成功: {bucket}/{md_key}")
+                
+                # 如果有完整响应，保存JSON和图片
+                if full_response:
+                    layout_results = full_response.get("result", {}).get("layoutParsingResults", [])
+                    
+                    # 保存每页的JSON文件
+                    for page_idx, res in enumerate(layout_results):
+                        # 保存prunedResult
+                        pruned_result = res.get("prunedResult", {})
+                        json_key = f"{md5}/json/{md5}_page{page_idx:03d}.json"
+                        json_data = json.dumps(pruned_result, ensure_ascii=False, indent=2).encode('utf-8')
+                        STORAGE_IMPL.put(bucket, json_key, json_data)
+                        logger.debug(f"[缓存] ✓ JSON保存成功: {bucket}/{json_key}")
+                        
+                        # 保存完整结果
+                        full_json_key = f"{md5}/json/{md5}_page{page_idx:03d}_full.json"
+                        full_json_data = json.dumps(res, ensure_ascii=False, indent=2).encode('utf-8')
+                        STORAGE_IMPL.put(bucket, full_json_key, full_json_data)
+                        logger.debug(f"[缓存] ✓ 完整JSON保存成功: {bucket}/{full_json_key}")
+                        
+                        # 保存每页的markdown
+                        markdown_data = res.get("markdown", {})
+                        markdown_text = markdown_data.get("text", "")
+                        if markdown_text:
+                            page_md_key = f"{md5}/markdown/{md5}_page{page_idx:03d}.md"
+                            STORAGE_IMPL.put(bucket, page_md_key, markdown_text.encode('utf-8'))
+                            logger.debug(f"[缓存] ✓ 页面Markdown保存成功: {bucket}/{page_md_key}")
+                        
+                        # 保存markdown中的图片（保存到markdown/imgs/目录，保持原路径）
+                        if PIL_AVAILABLE:
+                            markdown_images = markdown_data.get("images", {})
+                            for img_path, img_base64 in markdown_images.items():
+                                try:
+                                    img_bytes = base64.b64decode(img_base64)
+                                    # 图片路径保持原样：markdown/imgs/xxx（不需要images前缀）
+                                    # img_path通常是 "imgs/xxx.jpg" 格式
+                                    img_key = f"{md5}/markdown/{img_path}"
+                                    STORAGE_IMPL.put(bucket, img_key, img_bytes)
+                                    logger.debug(f"[缓存] ✓ Markdown图片保存成功: {bucket}/{img_key}")
+                                except Exception as e:
+                                    logger.warning(f"[缓存] 保存Markdown图片失败 {img_path}: {e}")
+                            
+                            # 保存可视化图片（outputImages）
+                            output_images = res.get("outputImages", {})
+                            for img_type, img_base64 in output_images.items():
+                                try:
+                                    img_bytes = base64.b64decode(img_base64)
+                                    img_key = f"{md5}/images/{img_type}/{md5}_page{page_idx:03d}_{img_type}.png"
+                                    STORAGE_IMPL.put(bucket, img_key, img_bytes)
+                                    logger.debug(f"[缓存] ✓ 可视化图片保存成功: {bucket}/{img_key}")
+                                except Exception as e:
+                                    logger.warning(f"[缓存] 保存可视化图片失败 {img_type}: {e}")
+            
+            else:
+                # Textin: 保存JSON和图片
+                json_key = f"{md5}/json/{md5}.json"
+                logger.debug(f"[缓存] 保存JSON到缓存: bucket={bucket}, key={json_key}, 大小={len(result_binary)} bytes")
+                STORAGE_IMPL.put(bucket, json_key, result_binary)
+                logger.info(f"[缓存] ✓ JSON保存成功: {bucket}/{json_key}")
+                
+                # 如果有完整响应，提取markdown和图片
+                if full_response and "result" in full_response:
+                    result = full_response["result"]
+                    
+                    # 保存markdown（如果有）
+                    if "markdown" in result:
+                        markdown_content = result["markdown"]
+                        if isinstance(markdown_content, str):
+                            md_key = f"{md5}/markdown/{md5}.md"
+                            STORAGE_IMPL.put(bucket, md_key, markdown_content.encode('utf-8'))
+                            logger.debug(f"[缓存] ✓ Markdown保存成功: {bucket}/{md_key}")
+                            
+                            # 提取并下载markdown中的图片（如果包含URL）
+                            # 注意：Textin返回的markdown可能包含图片URL，需要下载
+                            # 这里先保存markdown，图片下载可以在后续处理中完成
+                            
         except Exception as e:
             logger.error(f"[缓存] 保存缓存失败: MD5={md5}, OCR类型={self.ocr_type}, 错误: {e}", exc_info=True)
             # 不抛出异常，允许继续处理
     
-    def _call_ocr_api(self, pdf_binary: bytes) -> bytes:
-        """调用OCR API解析PDF"""
+    def _save_textin_markdown_images(self, md5: str, markdown_content: str, bucket: str):
+        """
+        从Textin的markdown中提取图片URL并下载保存到对象存储
+        图片保存到 markdown/imgs/ 目录，与PaddleOCR统一
+        
+        Args:
+            md5: 文档MD5值
+            markdown_content: Markdown内容（可能包含图片URL）
+            bucket: 存储bucket名称
+        """
+        try:
+            # 匹配markdown中的图片URL: ![...](https://...)
+            import re
+            pattern = r'!\[([^\]]*)\]\((https://[^\s\)]+\.(?:jpg|jpeg|png|gif|bmp|webp|svg))\)'
+            matches = re.findall(pattern, markdown_content, re.IGNORECASE)
+            
+            if not matches:
+                logger.debug(f"[缓存] Textin markdown中未找到图片URL")
+                return
+            
+            logger.info(f"[缓存] 从Textin markdown中提取到 {len(matches)} 个图片URL")
+            
+            # 下载并保存图片
+            for idx, (alt_text, img_url) in enumerate(matches):
+                try:
+                    # 下载图片
+                    response = requests.get(img_url, timeout=30)
+                    response.raise_for_status()
+                    img_bytes = response.content
+                    
+                    # 生成图片文件名
+                    from urllib.parse import urlparse
+                    parsed_url = urlparse(img_url)
+                    original_filename = os.path.basename(parsed_url.path)
+                    if not original_filename or '.' not in original_filename:
+                        url_hash = hashlib.md5(img_url.encode()).hexdigest()[:12]
+                        original_filename = f"{url_hash}.jpg"
+                    
+                    # 保存图片到 {md5}/markdown/imgs/{filename}（与PaddleOCR统一）
+                    img_key = f"{md5}/markdown/imgs/{original_filename}"
+                    STORAGE_IMPL.put(bucket, img_key, img_bytes)
+                    logger.debug(f"[缓存] ✓ Markdown图片保存成功: {bucket}/{img_key} ({len(img_bytes)} bytes)")
+                    
+                    # 更新markdown中的图片路径为相对路径 imgs/{filename}
+                    # 注意：这里只记录，实际的markdown更新可以在读取时处理
+                    
+                except Exception as e:
+                    logger.warning(f"[缓存] 下载Textin图片失败 {img_url}: {e}")
+                    
+        except Exception as e:
+            logger.warning(f"[缓存] 处理Textin markdown图片失败: {e}")
+    
+    def _call_ocr_api(self, pdf_binary: bytes) -> Tuple[bytes, Dict[str, Any]]:
+        """
+        调用OCR API解析PDF
+        
+        Returns:
+            Tuple[bytes, Dict]: (主要结果数据, 完整响应数据)
+            - 对于Textin: (result JSON bytes, 完整响应)
+            - 对于PaddleOCR: (markdown bytes, 完整响应)
+        """
         if not self.ocr_client:
             raise ValueError("OCR client not initialized. Please configure TEXTIN_OCR_APP_ID and TEXTIN_OCR_SECRET_CODE or PADDLE_OCR_API_URL")
         
@@ -763,28 +937,60 @@ class CustomPdfParser:
         
         try:
             if self.ocr_type == "textin":
-                # Textin API 调用（保持原有逻辑）
+                # Textin API 调用
                 response_text = self.ocr_client.recognize(pdf_binary)
                 ocr_duration = time.time() - ocr_start
                 logger.info(f"[OCR API] Textin OCR API调用成功，耗时: {ocr_duration:.2f}秒，响应大小: {len(response_text)} bytes")
                 
-                # 解析响应，提取result字段
+                # 解析响应
                 json_response = json.loads(response_text)
                 if "result" in json_response:
                     result_json = json.dumps(json_response["result"], ensure_ascii=False).encode('utf-8')
                     logger.info(f"[OCR API] 提取result字段成功，result大小: {len(result_json)} bytes")
-                    return result_json
+                    return result_json, json_response
                 else:
                     logger.error(f"[OCR API] Textin OCR API响应缺少'result'字段，响应键: {list(json_response.keys())}")
                     raise ValueError("Textin OCR API response missing 'result' field")
             
             elif self.ocr_type == "paddleocr":
-                # PaddleOCR API 调用，返回 markdown 文本
-                markdown_text = self.ocr_client.recognize(pdf_binary, options={"visualize": False})
+                # PaddleOCR API 调用，需要获取完整响应以提取图片
+                # 先调用API获取完整响应
+                file_base64 = base64.b64encode(pdf_binary).decode('utf-8')
+                payload = {
+                    "file": file_base64,
+                    "fileType": 0,  # 0=PDF, 1=图片
+                    "visualize": True  # 获取图片数据
+                }
+                
+                response = requests.post(
+                    self.ocr_client.api_url,
+                    json=payload,
+                    headers={"Content-Type": "application/json"},
+                    timeout=3600
+                )
+                response.raise_for_status()
+                result_data = response.json()
+                
+                if result_data.get("errorCode") != 0:
+                    error_msg = result_data.get("errorMsg", "Unknown error")
+                    raise ValueError(f"PaddleOCR API error: {error_msg}")
+                
+                # 提取markdown文本
+                layout_results = result_data.get("result", {}).get("layoutParsingResults", [])
+                markdown_parts = []
+                for res in layout_results:
+                    markdown_data = res.get("markdown", {})
+                    markdown_text = markdown_data.get("text", "")
+                    if markdown_text:
+                        # 图片路径保持原样：markdown/imgs/（不需要修正）
+                        markdown_parts.append(markdown_text)
+                
+                merged_markdown = "\n\n".join(markdown_parts)
                 ocr_duration = time.time() - ocr_start
-                logger.info(f"[OCR API] PaddleOCR 调用成功，耗时: {ocr_duration:.2f}秒，markdown大小: {len(markdown_text)} 字符")
-                # 返回 markdown 文本的字节形式（用于缓存）
-                return markdown_text.encode('utf-8')
+                logger.info(f"[OCR API] PaddleOCR 调用成功，耗时: {ocr_duration:.2f}秒，markdown大小: {len(merged_markdown)} 字符")
+                
+                # 返回markdown文本和完整响应
+                return merged_markdown.encode('utf-8'), result_data
             else:
                 raise ValueError(f"Unknown OCR type: {self.ocr_type}")
                 
@@ -896,13 +1102,13 @@ class CustomPdfParser:
             logger.info(f"[PDF解析] 调用 {self.ocr_type} OCR API 解析PDF: {filename} (MD5: {md5})")
             import time
             ocr_start_time = time.time()
-            result_binary = self._call_ocr_api(binary)
+            result_binary, full_response = self._call_ocr_api(binary)
             ocr_duration = time.time() - ocr_start_time
             logger.info(f"[PDF解析] OCR API 调用完成，耗时: {ocr_duration:.2f}秒，返回结果大小: {len(result_binary)} bytes")
             
-            # 4. 保存到缓存
+            # 4. 保存到缓存（包括图片等完整数据）
             logger.info(f"[PDF解析] 保存结果到缓存 (bucket: {self.result_cache_bucket}, OCR类型: {self.ocr_type})")
-            self._save_to_cache(md5, binary, result_binary)
+            self._save_to_cache(md5, binary, result_binary, full_response)
             logger.info(f"[PDF解析] ✓ 缓存保存完成")
             
             # 5. 解析结果
@@ -1638,13 +1844,10 @@ def chunk(filename: str, binary: Optional[bytes] = None, from_page: int = 0, to_
         if "tenant_id" in kwargs:
             custom_config["tenant_id"] = kwargs["tenant_id"]
         
-        # 确保bucket配置使用连字符（如果custom_config中没有指定，使用默认值）
-        if "pdf_cache_bucket" not in custom_config:
-            custom_config["pdf_cache_bucket"] = "pdf-cache"
-        # result_cache_bucket 会根据 OCR 类型自动设置为 paddleocr-cache 或 textin-cache，不需要配置
+        # bucket配置会由 CustomPdfParser._init_bucket_config() 自动处理
+        # 优先级：环境变量 > custom_config > 配置文件 > 默认值
         
         logger.info(f"[解析器初始化] Parser config: {parser_config}")
-        logger.info(f"[解析器初始化] Custom config bucket设置: pdf_cache_bucket={custom_config.get('pdf_cache_bucket', 'pdf-cache')}, result_cache_bucket将根据OCR类型自动选择")
         
         # 创建自定义解析器实例
         parser = CustomPdfParser(custom_config=custom_config)

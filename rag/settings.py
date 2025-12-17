@@ -31,6 +31,7 @@ AZURE = {}
 S3 = {}
 MINIO = {}
 OSS = {}
+COS = {}
 OS = {}
 
 # Initialize the selected configuration data based on environment variables to solve the problem of initialization errors due to lack of configuration
@@ -49,6 +50,8 @@ elif STORAGE_IMPL_TYPE == 'MINIO':
     MINIO = decrypt_database_config(name="minio")
 elif STORAGE_IMPL_TYPE == 'OSS':
     OSS = get_base_config("oss", {})
+elif STORAGE_IMPL_TYPE == 'COS':
+    COS = get_base_config("cos", {})
 
 try:
     REDIS = decrypt_database_config(name="redis")

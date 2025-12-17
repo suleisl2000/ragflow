@@ -23,6 +23,7 @@ from rag.utils.minio_conn import RAGFlowMinio
 from rag.utils.opendal_conn import OpenDALStorage
 from rag.utils.s3_conn import RAGFlowS3
 from rag.utils.oss_conn import RAGFlowOSS
+from rag.utils.cos_conn import RAGFlowCOS
 
 
 class Storage(Enum):
@@ -32,6 +33,7 @@ class Storage(Enum):
     AWS_S3 = 4
     OSS = 5
     OPENDAL = 6
+    COS = 7
 
 
 class StorageFactory:
@@ -41,7 +43,8 @@ class StorageFactory:
         Storage.AZURE_SAS: RAGFlowAzureSasBlob,
         Storage.AWS_S3: RAGFlowS3,
         Storage.OSS: RAGFlowOSS,
-        Storage.OPENDAL: OpenDALStorage
+        Storage.OPENDAL: OpenDALStorage,
+        Storage.COS: RAGFlowCOS
     }
 
     @classmethod
