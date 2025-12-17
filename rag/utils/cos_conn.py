@@ -15,6 +15,7 @@
 
 import logging
 import os
+import re
 import time
 from qcloud_cos import CosConfig, CosS3Client
 from qcloud_cos.cos_exception import CosClientError, CosServiceError
@@ -44,6 +45,10 @@ class RAGFlowCOS:
             os.environ.get('COS_SCHEME') or
             self.cos_config.get('scheme', 'https')
         )
+        self.appid = (
+            os.environ.get('COS_APPID') or
+            self.cos_config.get('appid', None)
+        )
         self.bucket = (
             os.environ.get('COS_BUCKET') or
             self.cos_config.get('bucket', None)
@@ -53,12 +58,41 @@ class RAGFlowCOS:
             self.cos_config.get('prefix_path', None)
         )
         self.__open__()
+    
+    def _normalize_bucket_name(self, bucket):
+        """
+        规范化bucket名称，确保格式为 bucketname-appid
+        腾讯云COS要求所有bucket名称必须遵循 bucketname-appid 格式
+        
+        如果bucket名称已经包含appid，直接返回；否则自动添加appid
+        """
+        if not bucket or not self.appid:
+            return bucket
+        
+        # 如果已经包含appid（格式为 bucketname-appid），直接返回
+        if bucket.endswith(f"-{self.appid}"):
+            return bucket
+        
+        # 检查是否已经包含其他appid格式（最后一部分是数字）
+        # 如果已经包含appid格式，使用配置的appid替换
+        parts = bucket.rsplit('-', 1)
+        if len(parts) == 2 and parts[1].isdigit():
+            # 已经包含appid格式，但可能不是当前配置的appid
+            # 使用配置的appid替换
+            bucket = f"{parts[0]}-{self.appid}"
+        else:
+            # 不包含appid，添加appid
+            bucket = f"{bucket}-{self.appid}"
+        
+        return bucket
 
     @staticmethod
     def use_default_bucket(method):
         def wrapper(self, bucket, *args, **kwargs):
             # If there is a default bucket, use the default bucket
             actual_bucket = self.bucket if self.bucket else bucket
+            # 规范化bucket名称（添加appid）
+            actual_bucket = self._normalize_bucket_name(actual_bucket)
             return method(self, actual_bucket, *args, **kwargs)
         return wrapper
     
@@ -85,6 +119,8 @@ class RAGFlowCOS:
                 Scheme=self.scheme
             )
             self.conn = CosS3Client(config)
+            normalized_bucket = self._normalize_bucket_name(self.bucket) if self.bucket else None
+            logging.info(f"[COS] 腾讯云COS对象存储已启用 - Region: {self.region}, Scheme: {self.scheme}, AppId: {self.appid or '未设置'}, DefaultBucket: {normalized_bucket or '未设置'}, PrefixPath: {self.prefix_path or '无'}")
         except Exception:
             logging.exception(f"Fail to connect to COS at region {self.region}")
 
@@ -99,13 +135,19 @@ class RAGFlowCOS:
             self.conn.head_bucket(Bucket=bucket)
             exists = True
         except (CosClientError, CosServiceError) as e:
-            if isinstance(e, CosServiceError) and e.get_error_code() == 'NoSuchBucket':
-                exists = False
+            # bucket不存在时返回False，不记录错误日志
+            if isinstance(e, CosServiceError):
+                error_code = e.get_error_code()
+                if error_code in ['NoSuchBucket', 'NoSuchResource']:
+                    exists = False
+                else:
+                    logging.warning(f"head_bucket error {bucket}: {error_code} - {e.get_error_msg()}")
+                    exists = False
             else:
-                logging.exception(f"head_bucket error {bucket}")
+                logging.warning(f"head_bucket error {bucket}: {str(e)}")
                 exists = False
-        except Exception:
-            logging.exception(f"head_bucket error {bucket}")
+        except Exception as e:
+            logging.warning(f"head_bucket error {bucket}: {str(e)}")
             exists = False
         return exists
 
@@ -125,6 +167,9 @@ class RAGFlowCOS:
             if not bucket:
                 logging.warning("health check: no bucket specified and no default bucket configured")
                 return False
+        
+        # 规范化bucket名称
+        bucket = self._normalize_bucket_name(bucket)
         
         fnm = "txtxtxtxt1"
         fnm, binary = f"{self.prefix_path}/{fnm}" if self.prefix_path else fnm, b"_t@@@1"
@@ -156,12 +201,25 @@ class RAGFlowCOS:
     @use_default_bucket
     def put(self, bucket, fnm, binary):
         logging.debug(f"bucket name {bucket}; filename :{fnm}:")
-        for _ in range(1):
+        max_retries = 3
+        for retry in range(max_retries):
             try:
                 if not self.bucket_exists(bucket):
                     try:
                         self.conn.create_bucket(Bucket=bucket)
                         logging.info(f"create bucket {bucket} ********")
+                        # COS创建bucket后可能需要等待一段时间才能使用（最终一致性）
+                        # 等待并重试bucket_exists确认bucket已创建
+                        for wait_retry in range(5):
+                            time.sleep(0.5)  # 等待0.5秒
+                            if self.bucket_exists(bucket):
+                                break
+                            if wait_retry == 4:
+                                logging.warning(f"Bucket {bucket} created but not immediately available, will retry put operation")
+                    except CosServiceError as e:
+                        # 如果bucket已存在，忽略错误
+                        if e.get_error_code() not in ['BucketAlreadyExists', 'BucketAlreadyOwnedByYou']:
+                            logging.exception(f"Fail to create bucket {bucket}")
                     except Exception:
                         logging.exception(f"Fail to create bucket {bucket}")
                 
@@ -171,10 +229,27 @@ class RAGFlowCOS:
                     Key=fnm
                 )
                 return True
-            except Exception:
+            except CosServiceError as e:
+                error_code = e.get_error_code()
+                if error_code == 'NoSuchBucket' and retry < max_retries - 1:
+                    # bucket不存在，可能是刚创建还未生效，等待后重试
+                    logging.warning(f"Bucket {bucket} not available yet, retrying... (attempt {retry + 1}/{max_retries})")
+                    time.sleep(1)
+                    continue
+                else:
+                    logging.exception(f"Fail put {bucket}/{fnm}: {error_code} - {e.get_error_msg()}")
+                    if retry < max_retries - 1:
+                        time.sleep(1)
+                        continue
+                    return False
+            except Exception as e:
                 logging.exception(f"Fail put {bucket}/{fnm}")
-                self.__open__()
-                time.sleep(1)
+                if retry < max_retries - 1:
+                    self.__open__()
+                    time.sleep(1)
+                    continue
+                return False
+        return False
 
     @use_prefix_path
     @use_default_bucket
@@ -194,16 +269,33 @@ class RAGFlowCOS:
     @use_prefix_path
     @use_default_bucket
     def get(self, bucket, fnm):
-        for _ in range(1):
+        max_retries = 3
+        for retry in range(max_retries):
             try:
                 response = self.conn.get_object(Bucket=bucket, Key=fnm)
                 object_data = response['Body'].read()
                 return object_data
-            except Exception:
+            except CosServiceError as e:
+                error_code = e.get_error_code()
+                if error_code == 'NoSuchBucket' and retry < max_retries - 1:
+                    # bucket不存在，可能是刚创建还未生效，等待后重试
+                    logging.warning(f"Bucket {bucket} not available yet, retrying... (attempt {retry + 1}/{max_retries})")
+                    time.sleep(1)
+                    continue
+                else:
+                    logging.exception(f"fail get {bucket}/{fnm}: {error_code} - {e.get_error_msg()}")
+                    if retry < max_retries - 1:
+                        time.sleep(1)
+                        continue
+                    return None
+            except Exception as e:
                 logging.exception(f"fail get {bucket}/{fnm}")
-                self.__open__()
-                time.sleep(1)
-        return
+                if retry < max_retries - 1:
+                    self.__open__()
+                    time.sleep(1)
+                    continue
+                return None
+        return None
 
     @use_prefix_path
     @use_default_bucket
