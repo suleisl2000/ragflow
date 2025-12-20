@@ -569,7 +569,7 @@ class CustomPdfParser:
             logger.warning(f"Failed to initialize LLM model for keyword generation: {e}")
             self.chat_mdl = None
     
-    def _generate_keywords(self, content: str, topn: int = 5, context: str = "") -> tuple:
+    def _generate_keywords(self, content: str, topn: int = 8, context: str = "") -> tuple:
         """
         统一的关键词生成方法（带缓存）
         
@@ -605,7 +605,7 @@ class CustomPdfParser:
         
         return result
     
-    def _generate_keywords_impl(self, content: str, topn: int = 5, context: str = "") -> tuple:
+    def _generate_keywords_impl(self, content: str, topn: int = 8, context: str = "") -> tuple:
         """
         实际的关键词生成实现
         """
@@ -1364,7 +1364,7 @@ class CustomPdfParser:
         if section_title:
             content_for_keywords = f"{section_title}"
             chunk["important_kwd"], chunk["important_tks"] = self._generate_keywords(
-                content_for_keywords, topn=5, context=f"text_content '{section_title}'"
+                content_for_keywords, topn=8, context=f"text_content '{section_title}'"
             )
         
         return chunk
@@ -1554,7 +1554,7 @@ class CustomPdfParser:
             #content_for_keywords = f"{section_title}\n{text}"
             content_for_keywords = f"{section_title}"
             chunk["important_kwd"], chunk["important_tks"] = self._generate_keywords(
-                content_for_keywords, topn=5, context=f"text_content '{section_title}'"
+                content_for_keywords, topn=8, context=f"text_content '{section_title}'"
             )
         
         return chunk
