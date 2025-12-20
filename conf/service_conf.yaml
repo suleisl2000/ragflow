@@ -40,37 +40,25 @@ ocr:
     secret_code: ''
     api_url: 'https://api.textin.com/ai/service/v1/pdf_to_markdown'
 
-# 混合配置：LLM 使用 Tongyi-Qianwen，Embedding 使用 LocalAI
+# Custom Parser 缓存bucket配置（支持环境变量覆盖）
+# 环境变量优先级：PDF_CACHE_BUCKET, PADDLEOCR_CACHE_BUCKET, TEXTIN_CACHE_BUCKET
+pdf_cache_bucket: 'medguide-pdf-cache'
+paddleocr_cache_bucket: 'medguide-paddleocr-cache'
+textin_cache_bucket: 'medguide-textin-cache'
+
 user_default_llm:
-  factory: 'Tongyi-Qianwen'  # 默认工厂（如果模型未指定则使用此）
-  api_key: 'sk-xxx'
-  base_url: 'https://dashscope.aliyuncs.com/compatible-mode/v1'
+  factory: 'LocalAI'  # 默认工厂
+  api_key: 'empty'  # LocalAI 一般不需要真实的 API key
+  base_url: ''  # 每个模型有自己的 base_url
   default_models:
     chat_model:
-      name: 'qwen3-8b'
-      factory: 'Tongyi-Qianwen'
-      api_key: 'sk-xxx'
-      base_url: 'https://dashscope.aliyuncs.com/compatible-mode/v1'
+      name: 'qwen3-8b-fp8'
+      factory: 'LocalAI'
+      api_key: 'empty'
+      base_url: 'http://localhost:8090'
     embedding_model:
-      name: 'Qwen3-Embedding-8B'
+      name: 'qwen3-embedding-8b'
       factory: 'LocalAI'
       api_key: 'empty'
       base_url: 'http://localhost:8082'
-
-# 之前的 Tongyi-Qianwen 配置（已注释，需要时可以恢复）
-#user_default_llm:
-#  factory: 'Tongyi-Qianwen'
-#  api_key: 'sk-xxx'
-#  base_url: 'https://dashscope.aliyuncs.com/compatible-mode/v1'
-#  default_models:
-#    chat_model:
-#      name: 'qwen-plus'
-#      factory: 'Tongyi-Qianwen'
-#      api_key: 'sk-xxx'
-#      base_url: 'https://dashscope.aliyuncs.com/compatible-mode/v1'
-#    embedding_model:
-#      name: 'text-embedding-v3'
-#      factory: 'Tongyi-Qianwen'
-#      api_key: 'sk-xxx'
-#      base_url: 'https://dashscope.aliyuncs.com/compatible-mode/v1'
 
