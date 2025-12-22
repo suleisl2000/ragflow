@@ -552,8 +552,22 @@ async def run_dataflow(task: dict):
         try:
             set_progress(task_id, prog=0.82, msg="\n-------------------------------------\nStart to embedding...")
             e, kb = KnowledgebaseService.get_by_id(task["kb_id"])
-            embedding_id = kb.embd_id
-            embedding_model = LLMBundle(task["tenant_id"], LLMType.EMBEDDING, llm_name=embedding_id)
+            # 知识库构建时使用配置的 embedding 模型
+            from api.utils.configs import get_base_config
+            kb_llm_config = get_base_config("kb_default_llm", {}) or {}
+            kb_default_models = kb_llm_config.get("default_models", {}) or {}
+            embedding_model_config = kb_default_models.get("embedding_model", {}) or {}
+            
+            if embedding_model_config.get("name"):
+                # 使用配置的知识库构建 embedding 模型
+                embd_name = embedding_model_config.get("name")
+                embd_factory = embedding_model_config.get("factory", "LocalAI")
+                embd_id = f"{embd_name}@{embd_factory}"
+                embedding_model = LLMBundle(task["tenant_id"], LLMType.EMBEDDING, llm_name=embd_id)
+            else:
+                # 回退到知识库配置的 embedding 模型
+                embedding_id = kb.embd_id
+                embedding_model = LLMBundle(task["tenant_id"], LLMType.EMBEDDING, llm_name=embedding_id)
             @timeout(60)
             def batch_encode(txts):
                 nonlocal embedding_model

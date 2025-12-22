@@ -51,11 +51,32 @@ user_default_llm:
   api_key: 'empty'  # LocalAI 一般不需要真实的 API key
   base_url: ''  # 每个模型有自己的 base_url
   default_models:
+    # Chat 模型（用于对话）
+    chat_model:
+      name: 'qwen-plus'
+      factory: 'Tongyi-Qianwen'
+      api_key: 'empty'  # 需要配置实际的 API key
+      base_url: 'https://dashscope.aliyuncs.com/compatible-mode/v1'
+    # Embedding 模型
+    embedding_model:
+      name: 'qwen3-embedding-8b'
+      factory: 'LocalAI'
+      api_key: 'empty'
+      base_url: 'http://localhost:8082'
+
+# 知识库构建时使用的模型配置
+kb_default_llm:
+  factory: 'LocalAI'  # 默认工厂
+  api_key: 'empty'  # LocalAI 一般不需要真实的 API key
+  base_url: ''  # 每个模型有自己的 base_url
+  default_models:
+    # 索引构建时的关键词提取模型
     chat_model:
       name: 'qwen3-8b-fp8'
       factory: 'LocalAI'
       api_key: 'empty'
       base_url: 'http://localhost:8090'
+    # 索引构建时的 embedding 模型
     embedding_model:
       name: 'qwen3-embedding-8b'
       factory: 'LocalAI'

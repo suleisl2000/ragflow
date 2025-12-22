@@ -553,16 +553,28 @@ class CustomPdfParser:
             )
     
     def _init_llm_model(self):
-        """初始化LLM模型用于关键词生成"""
+        """初始化LLM模型用于关键词生成（索引构建时）"""
         try:
-
             # 获取租户ID
             tenant_id = self.custom_config.get("tenant_id")
             if tenant_id:
-                # 直接使用LLMBundle初始化，不指定具体模型名称，使用默认模型
-                self.chat_mdl = LLMBundle(tenant_id, LLMType.CHAT)
-                #self.chat_mdl = None
-                logger.info(f"Custom parser LLM model initialized for tenant: {tenant_id}")
+                # 从配置文件读取知识库构建时的关键词提取模型
+                from api.utils.configs import get_base_config
+                kb_llm_config = get_base_config("kb_default_llm", {}) or {}
+                kb_default_models = kb_llm_config.get("default_models", {}) or {}
+                chat_model = kb_default_models.get("chat_model", {}) or {}
+                
+                if chat_model.get("name"):
+                    # 使用配置的知识库构建关键词提取模型
+                    model_name = chat_model.get("name")
+                    factory = chat_model.get("factory", "LocalAI")
+                    model_id = f"{model_name}@{factory}"
+                    self.chat_mdl = LLMBundle(tenant_id, LLMType.CHAT, llm_name=model_id)
+                    logger.info(f"Custom parser LLM model initialized for KB indexing keyword extraction: {model_id} (tenant: {tenant_id})")
+                else:
+                    # 回退到默认模型
+                    self.chat_mdl = LLMBundle(tenant_id, LLMType.CHAT)
+                    logger.info(f"Custom parser LLM model initialized with default model (tenant: {tenant_id})")
             else:
                 logger.warning("No tenant_id provided, keyword generation will be disabled")
         except Exception as e:
