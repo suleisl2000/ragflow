@@ -335,7 +335,14 @@ async def build_chunks(task, progress_callback):
     if task["parser_config"].get("auto_keywords", 0):
         st = timer()
         progress_callback(msg="Start to generate keywords for every chunk ...")
-        chat_mdl = LLMBundle(task["tenant_id"], LLMType.CHAT, llm_name=task["llm_id"], lang=task["language"])
+        # 索引构建场景：使用 kb_default_llm.chat_model
+        from api.utils.model_selector import get_chat_model_for_scenario
+        chat_model_id = get_chat_model_for_scenario(task["tenant_id"], scenario="indexing")
+        if chat_model_id:
+            chat_mdl = LLMBundle(task["tenant_id"], LLMType.CHAT, llm_name=chat_model_id, lang=task["language"])
+        else:
+            # 如果配置文件中没有，回退到数据库值
+            chat_mdl = LLMBundle(task["tenant_id"], LLMType.CHAT, llm_name=task["llm_id"], lang=task["language"])
 
         async def doc_keyword_extraction(chat_mdl, d, topn):
             cached = get_llm_cache(chat_mdl.llm_name, d["content_with_weight"], "keywords", {"topn": topn})
