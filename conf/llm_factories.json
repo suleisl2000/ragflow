@@ -831,7 +831,22 @@
             "logo": "",
             "tags": "LLM,TEXT EMBEDDING,SPEECH2TEXT,MODERATION",
             "status": "1",
-            "llm": []
+            "llm": [
+                {
+                    "llm_name": "qwen3-8b-fp8",
+                    "tags": "LLM,CHAT,128k",
+                    "max_tokens": 128000,
+                    "model_type": "chat",
+                    "is_tools": true
+                },
+                {
+                    "llm_name": "qwen3-embedding-8b",
+                    "tags": "TEXT EMBEDDING",
+                    "max_tokens": 8192,
+                    "model_type": "embedding",
+                    "is_tools": false
+                }
+            ]
         },
         {
             "name": "OpenAI-API-Compatible",
