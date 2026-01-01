@@ -89,8 +89,11 @@ class RAGFlowCOS:
     @staticmethod
     def use_default_bucket(method):
         def wrapper(self, bucket, *args, **kwargs):
-            # If there is a default bucket, use the default bucket
-            actual_bucket = self.bucket if self.bucket else bucket
+            # 优先使用传入的 bucket 参数，如果未传入（None 或空字符串）才使用默认 bucket
+            # 这样可以支持不同的 bucket（如 pdf-cache, paddleocr-cache 等）
+            actual_bucket = bucket if bucket else (self.bucket if self.bucket else None)
+            if not actual_bucket:
+                raise ValueError("Bucket name is required (either as parameter or default bucket)")
             # 规范化bucket名称（添加appid）
             normalized_bucket = self._normalize_bucket_name(actual_bucket)
             # 记录规范化后的bucket名称
