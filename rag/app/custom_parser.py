@@ -43,34 +43,50 @@ from api.utils.configs import read_config, get_base_config
 
 logger = logging.getLogger(__name__)
 
-# 标题模式列表（从 gen_title_report.py 复制）
+# 扩展的标题模式列表（按优先级从高到低排序）
+# 格式: (pattern, priority, dot_count)
+# priority: 优先级，数字越小优先级越高
+# dot_count: 点号数量（仅用于数字x.x格式，其他模式为None）
+# 在相同 markdown 层级内，根据优先级动态映射到连续层级
 TITLE_PATTERNS = [
-    # 模式0: 以1个或多个空格开头的markdown标题，或作为兜底匹配所有不匹配其他模式的标题（优先级0，与模式1同级）
+    # 模式0: 以1个或多个空格开头的markdown标题，或作为兜底匹配所有不匹配其他模式的标题（优先级0，与模式1a同级）
     (
         r"^.+",
         0,
         None
     ),
-    # 模式1: 第X章/节/条等（优先级0）
+    # 模式1a: 第X编/部分/篇/章（优先级0，最高）
     (
-        r"^第[零一二三四五六七八九十百千0-9]+(分?编|部分|篇|章|节|条)",
+        r"^第[零一二三四五六七八九十百千0-9]+(分?编|部分|篇|章)",
         0,
         None
     ),
-    # 模式2: 一、二、三、（中文数字+顿号/全角点号/空格，优先级1）
-    # 支持：一、 一． 一 （中文数字后跟顿号、全角点号或空格）
+    # 模式1b: 第X节（优先级1）
     (
-        r"^([零一二三四五六七八九十百千]+|[一二三四五六七八九十]+)([、．]|\s+)",
+        r"^第[零一二三四五六七八九十百千0-9]+节",
         1,
         None
     ),
-    # 模式3: （一）（二）（中文括号+中文数字，优先级2）
+    # 模式1c: 第X条（优先级2）
     (
-        r"^[（(]([零一二三四五六七八九十百]+|[一二三四五六七八九十]+)[）)]",
+        r"^第[零一二三四五六七八九十百千0-9]+条",
         2,
         None
     ),
-    # 模式4: "数字+空格"、"数字+、"、"数字+."（优先级3）
+    # 模式2: 一、二、三、（中文数字+顿号/全角点号/空格，优先级3）
+    # 支持：一、 一． 一 （中文数字后跟顿号、全角点号或空格）
+    (
+        r"^([零一二三四五六七八九十百千]+|[一二三四五六七八九十]+)([、．]|\s+)",
+        3,
+        None
+    ),
+    # 模式3: （一）（二）（中文括号+中文数字，优先级4）
+    (
+        r"^[（(]([零一二三四五六七八九十百]+|[一二三四五六七八九十]+)[）)]",
+        4,
+        None
+    ),
+    # 模式4: "数字+空格"、"数字+、"、"数字+."（优先级5）
     # 注意：不能匹配数字x.x.x格式（由模式5-9处理）
     # 注意：不能匹配"数字+空格+右括号"格式（由模式9处理）
     # 匹配格式：数字+空格/点号/顿号+标题内容
@@ -78,53 +94,53 @@ TITLE_PATTERNS = [
     # 支持的格式示例："3 局限性和未来的方向"、"2 2019 年更新共识的主要内容"、"1. 适应证"、"1、 病史"
     (
         r"^([0-9]{1,2})(\s+|[、.．]\s*)(?![0-9]{1,3}(?![0-9])|[）)]|$)",
-        3,
+        5,
         None
     ),
-    # 模式5: 数字x.x格式（优先级4）
+    # 模式5: 数字x.x格式（优先级6）
     (
         r"^([0-9]{1,2}\.[0-9]{1,2})(?![0-9.])",
-        4,
+        6,
         1
     ),
-    # 模式6: 数字x.x.x格式（优先级5）
+    # 模式6: 数字x.x.x格式（优先级7）
     (
         r"^([0-9]{1,2}\.[0-9]{1,2}\.[0-9]{1,2})(?![0-9.])",
-        5,
+        7,
         2
     ),
-    # 模式7: 数字x.x.x.x格式（优先级6）
+    # 模式7: 数字x.x.x.x格式（优先级8）
     (
         r"^([0-9]{1,2}\.[0-9]{1,2}\.[0-9]{1,2}\.[0-9]{1,2})(?![0-9.])",
-        6,
+        8,
         3
     ),
-    # 模式8: 数字x.x.x.x.x格式（优先级7）
+    # 模式8: 数字x.x.x.x.x格式（优先级9）
     (
         r"^([0-9]{1,2}\.[0-9]{1,2}\.[0-9]{1,2}\.[0-9]{1,2}\.[0-9]{1,2})(?![0-9.])",
-        7,
+        9,
         4
     ),
-    # 模式9: 数字（1）格式或数字+空格+右括号格式（优先级8）
+    # 模式9: 数字（1）格式或数字+空格+右括号格式（优先级10）
     # 支持: "（1）"、"(1)"、"1 ）"、"2 ）" 等格式
     (
         r"^(?:[（(]([0-9]{1,2})[）)]|([0-9]{1,2})\s+[）)])",
-        8,
+        10,
         None
     ),
-    # 模式10: "问题1"、"问题一"、"临床问题1"、"临床问题 1"、"问题 1"、"陈述1"、"陈述 1"格式（优先级9）
+    # 模式10: "问题1"、"问题一"、"临床问题1"、"临床问题 1"、"问题 1"、"陈述1"、"陈述 1"格式（优先级11）
     # 支持: "问题1"、"问题一"、"问题 1"、"临床问题1"、"临床问题 1"、"临床问题一"、"陈述1"、"陈述 1"、"陈述一" 等格式
     (
         r"^((?:临床)?(?:问题|陈述))\s*([0-9]+|[零一二三四五六七八九十百千]+)",
-        9,
+        11,
         None
     ),
-    # 模式11: "推荐意见1"、"推荐意见一"格式（优先级10，低于模式10）
+    # 模式11: "推荐意见1"、"推荐意见一"格式（优先级12，低于模式10）
     # 支持: "推荐意见1"、"推荐意见一"、"推荐意见2"、"推荐意见二" 等格式
     # 注意：优先级低于模式10（问题1），由于正则表达式互斥（模式10以"问题"开头，模式11以"推荐意见"开头），不会同时匹配
     (
         r"^推荐意见([0-9]+|[零一二三四五六七八九十百千]+)",
-        10,
+        12,
         None
     ),
 ]
@@ -247,13 +263,22 @@ def adjust_title_levels(titles: list) -> list:
     # 对于模式0，只保留紧挨在模式2（"一、"）之前的匹配标题
     # 如果有多个"一、"标题，每个"一、"之前如果有匹配模式0的标题都要保留
     # 但是"二、"或其他模式2之前的模式0不保留
-    pattern1_regex = TITLE_PATTERNS[1][0]  # 模式1的正则表达式
-    pattern2_regex = TITLE_PATTERNS[2][0]  # 模式2的正则表达式（"一、"、"二、"等）
+    # 注意：模式1a、1b、1c的正则表达式（用于判断是否匹配模式1）
+    pattern1a_regex = TITLE_PATTERNS[1][0]  # 模式1a的正则表达式（第X编/部分/篇/章）
+    pattern1b_regex = TITLE_PATTERNS[2][0]  # 模式1b的正则表达式（第X节）
+    pattern1c_regex = TITLE_PATTERNS[3][0]  # 模式1c的正则表达式（第X条）
+    pattern2_regex = TITLE_PATTERNS[4][0]  # 模式2的正则表达式（"一、"、"二、"等）
+    
+    # 判断是否匹配模式1（1a、1b、1c中的任意一个）
+    def matches_pattern1(content):
+        return (re.match(pattern1a_regex, content) or 
+                re.match(pattern1b_regex, content) or 
+                re.match(pattern1c_regex, content))
     
     # 找到所有模式2（"一、"）的标题位置
     keep_pattern0_indices = set()
     for i, (idx, title, priority, dot_count) in enumerate(valid_titles):
-        if priority == 1:  # 模式2的优先级是1
+        if priority == 3:  # 模式2的优先级是3（已从1调整为3）
             # 检查是否是"一、"（匹配模式2的正则，且内容以"一、"开头）
             title_content = title['content'].strip()
             if re.match(pattern2_regex, title_content):
@@ -264,7 +289,7 @@ def adjust_title_levels(titles: list) -> list:
                     if i > 0:
                         prev_idx, prev_title, prev_priority, prev_dot_count = valid_titles[i - 1]
                         # 如果前一个标题是模式0（优先级0且不匹配模式1）
-                        if prev_priority == 0 and not re.match(pattern1_regex, prev_title['content'].strip()):
+                        if prev_priority == 0 and not matches_pattern1(prev_title['content'].strip()):
                             # 标记为保留
                             keep_pattern0_indices.add(prev_idx)
     
@@ -273,7 +298,7 @@ def adjust_title_levels(titles: list) -> list:
     filtered_titles = []
     for idx, title, priority, dot_count in valid_titles:
         # 如果是模式0（优先级0且不匹配模式1）
-        if priority == 0 and not re.match(pattern1_regex, title['content'].strip()):
+        if priority == 0 and not matches_pattern1(title['content'].strip()):
             # 检查是否是前言性标题
             content = title['content'].strip()
             content_no_spaces = content.replace(' ', '').replace('　', '')
@@ -290,19 +315,20 @@ def adjust_title_levels(titles: list) -> list:
     valid_titles = filtered_titles
     
     # 检查模式0和模式1是否在同一Level（互斥检查）
-    # 注意：custom_parser.py不返回has_conflict，但保留检查逻辑以便将来使用
+    has_conflict = False
     has_pattern0 = False
     has_pattern1 = False
     
     for idx, title, priority, dot_count in valid_titles:
         if priority == 0:
-            if re.match(pattern1_regex, title['content'].strip()):
+            if matches_pattern1(title['content'].strip()):
                 has_pattern1 = True
             else:
                 has_pattern0 = True
     
-    # 如果同时存在模式0和模式1，则冲突（这里只做检查，不返回）
-    # has_conflict = has_pattern0 and has_pattern1
+    # 如果同时存在模式0和模式1，则冲突
+    if has_pattern0 and has_pattern1:
+        has_conflict = True
     
     # 创建 (priority, dot_count) 对，用于排序和映射
     priority_dot_pairs = set()
