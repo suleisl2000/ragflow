@@ -812,7 +812,7 @@ class CustomPdfParser:
         try:
             # 保存PDF到pdf-cache bucket（保持原有结构）
             pdf_key = f"{md5}.pdf"
-            logger.debug(f"[缓存] 保存PDF到缓存: bucket={self.pdf_cache_bucket}, key={pdf_key}, 大小={len(pdf_binary)} bytes")
+            logger.info(f"[缓存] 保存PDF到缓存: bucket={self.pdf_cache_bucket}, key={pdf_key}, 大小={len(pdf_binary)} bytes")
             try:
                 result = STORAGE_IMPL.put(self.pdf_cache_bucket, pdf_key, pdf_binary)
                 if result:
@@ -824,6 +824,7 @@ class CustomPdfParser:
                 raise
             
             bucket = self.result_cache_bucket
+            logger.info(f"[缓存] 保存OCR结果到缓存: bucket={bucket}, OCR类型={self.ocr_type}")
             
             if self.ocr_type == "paddleocr":
                 # PaddleOCR: 保存markdown和图片

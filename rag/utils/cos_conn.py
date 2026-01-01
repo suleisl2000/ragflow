@@ -92,13 +92,18 @@ class RAGFlowCOS:
             # 优先使用传入的 bucket 参数，如果未传入（None 或空字符串）才使用默认 bucket
             # 这样可以支持不同的 bucket（如 pdf-cache, paddleocr-cache 等）
             actual_bucket = bucket if bucket else (self.bucket if self.bucket else None)
+            
             if not actual_bucket:
+                logging.error(f"[COS] Bucket名称缺失: 传入参数={bucket}, 默认bucket={self.bucket}")
                 raise ValueError("Bucket name is required (either as parameter or default bucket)")
+            
             # 规范化bucket名称（添加appid）
             normalized_bucket = self._normalize_bucket_name(actual_bucket)
-            # 记录规范化后的bucket名称
+            
+            # 只在 bucket 名称发生变化时记录（避免频繁日志）
             if normalized_bucket != actual_bucket:
                 logging.info(f"[COS] Bucket名称规范化: {actual_bucket} -> {normalized_bucket}")
+            
             return method(self, normalized_bucket, *args, **kwargs)
         return wrapper
     
@@ -151,43 +156,17 @@ class RAGFlowCOS:
 
     def health(self, bucket=None):
         """
-        健康检查：测试COS连接和基本操作
+        健康检查：直接返回 True（不进行实际检查）
         
         Args:
-            bucket: 可选，指定测试用的bucket。如果不指定，使用配置的默认bucket
+            bucket: 可选，指定测试用的bucket（当前未使用）
         
         Returns:
-            bool: 健康检查是否通过
+            bool: 始终返回 True
         """
-        # 如果没有指定bucket，使用配置的默认bucket
-        if bucket is None:
-            bucket = self.bucket
-            if not bucket:
-                logging.warning("health check: no bucket specified and no default bucket configured")
-                return False
-        
-        # 规范化bucket名称
-        bucket = self._normalize_bucket_name(bucket)
-        
-        fnm = "txtxtxtxt1"
-        fnm, binary = f"{self.prefix_path}/{fnm}" if self.prefix_path else fnm, b"_t@@@1"
-        if not self.bucket_exists(bucket):
-            try:
-                self.conn.create_bucket(Bucket=bucket)
-                logging.debug(f"create bucket {bucket} ********")
-            except Exception:
-                logging.exception(f"Fail to create bucket {bucket}")
-
-        try:
-            self.conn.put_object(
-                Bucket=bucket,
-                Body=binary,
-                Key=fnm
-            )
-            return True
-        except Exception:
-            logging.exception(f"Fail to put object in health check")
-            return False
+        # 暂时不进行实际检查，直接返回 True
+        # 这样可以避免频繁的 COS 操作和日志输出
+        return True
 
     def get_properties(self, bucket, key):
         return {}
