@@ -293,8 +293,23 @@ def adjust_title_levels(titles: list) -> list:
                             # 标记为保留
                             keep_pattern0_indices.add(prev_idx)
     
+    # 检查文档中是否只有模式0标题（用于决定是否保留所有模式0标题）
+    # 支持的文档例子：如"2023年左心瓣膜术后三尖瓣反流诊疗中国专家共识"，只有模式0标题（如"发病机制"、"术前评估"等）
+    has_other_patterns = False
+    for idx, title, priority, dot_count in valid_titles:
+        if priority > 0:  # 存在其他模式的标题（优先级 > 0）
+            has_other_patterns = True
+            break
+        elif priority == 0:
+            # 检查是否是模式1（模式1a/1b/1c的优先级也是0，但通过matches_pattern1区分）
+            if matches_pattern1(title['content'].strip()):
+                has_other_patterns = True
+                break
+    has_only_pattern0 = not has_other_patterns
+    
     # 过滤掉所有未标记保留的模式0标题
     # 注意：前言性标题（匹配PREFACE_TITLES的标题）应该保留，不应该被过滤
+    # 如果文档中只有模式0标题，则保留所有模式0标题（兼容只有模式0标题的文档场景）
     filtered_titles = []
     for idx, title, priority, dot_count in valid_titles:
         # 如果是模式0（优先级0且不匹配模式1）
@@ -308,9 +323,15 @@ def adjust_title_levels(titles: list) -> list:
                          content_no_spaces in PREFACE_TITLES or
                          content_no_spaces_no_colon in PREFACE_TITLES)
             
-            # 如果是前言性标题，保留；否则只有当它被标记为保留时（即紧挨在"一、"之前），才保留
-            if not is_preface and idx not in keep_pattern0_indices:
-                continue
+            # 如果文档中只有模式0标题，保留所有模式0标题
+            # 否则，只保留前言性标题或紧挨在"一、"之前的模式0标题（原有逻辑）
+            if has_only_pattern0:
+                # 保留所有模式0标题，不进行过滤
+                pass
+            else:
+                # 原有逻辑：如果是前言性标题，保留；否则只有当它被标记为保留时（即紧挨在"一、"之前），才保留
+                if not is_preface and idx not in keep_pattern0_indices:
+                    continue
         filtered_titles.append((idx, title, priority, dot_count))
     valid_titles = filtered_titles
     
