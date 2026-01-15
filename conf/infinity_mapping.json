@@ -40,5 +40,9 @@
 	"n_hop_with_weight": {"type": "varchar", "default": ""},
 	"removed_kwd": {"type": "varchar", "default": "", "analyzer": "whitespace-#"},
 
-	"doc_type_kwd": {"type": "varchar", "default": "", "analyzer": "whitespace-#"}
+	"doc_type_kwd": {"type": "varchar", "default": "", "analyzer": "whitespace-#"},
+
+	"parent_section_id": {"type": "varchar", "default": "", "analyzer": "whitespace-#"},
+	"section_path": {"type": "varchar", "default": "", "analyzer": "whitespace-#"},
+	"paragraph_chunk_ids": {"type": "varchar", "default": "", "analyzer": "whitespace-#"}
 }

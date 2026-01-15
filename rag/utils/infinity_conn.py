@@ -215,44 +215,74 @@ class InfinityConnection(DocStoreConnection):
 
     def createIdx(self, indexName: str, knowledgebaseId: str, vectorSize: int):
         table_name = f"{indexName}_{knowledgebaseId}"
-        inf_conn = self.connPool.get_conn()
-        inf_db = inf_conn.create_database(self.dbName, ConflictType.Ignore)
+        inf_conn = None
+        try:
+            inf_conn = self.connPool.get_conn()
+            inf_db = inf_conn.create_database(self.dbName, ConflictType.Ignore)
 
-        fp_mapping = os.path.join(get_project_base_directory(), "conf", "infinity_mapping.json")
-        if not os.path.exists(fp_mapping):
-            raise Exception(f"Mapping file not found at {fp_mapping}")
-        schema = json.load(open(fp_mapping))
-        vector_name = f"q_{vectorSize}_vec"
-        schema[vector_name] = {"type": f"vector,{vectorSize},float"}
-        inf_table = inf_db.create_table(
-            table_name,
-            schema,
-            ConflictType.Ignore,
-        )
-        inf_table.create_index(
-            "q_vec_idx",
-            IndexInfo(
-                vector_name,
-                IndexType.Hnsw,
-                {
-                    "M": "16",
-                    "ef_construction": "50",
-                    "metric": "cosine",
-                    "encode": "lvq",
-                },
-            ),
-            ConflictType.Ignore,
-        )
-        for field_name, field_info in schema.items():
-            if field_info["type"] != "varchar" or "analyzer" not in field_info:
-                continue
-            inf_table.create_index(
-                f"text_idx_{field_name}",
-                IndexInfo(field_name, IndexType.FullText, {"ANALYZER": field_info["analyzer"]}),
+            fp_mapping = os.path.join(get_project_base_directory(), "conf", "infinity_mapping.json")
+            if not os.path.exists(fp_mapping):
+                raise Exception(f"Mapping file not found at {fp_mapping}")
+            schema = json.load(open(fp_mapping))
+            vector_name = f"q_{vectorSize}_vec"
+            schema[vector_name] = {"type": f"vector,{vectorSize},float"}
+            inf_table = inf_db.create_table(
+                table_name,
+                schema,
                 ConflictType.Ignore,
             )
-        self.connPool.release_conn(inf_conn)
-        logger.info(f"INFINITY created table {table_name}, vector size {vectorSize}")
+            
+            # 创建向量索引
+            try:
+                inf_table.create_index(
+                    "q_vec_idx",
+                    IndexInfo(
+                        vector_name,
+                        IndexType.Hnsw,
+                        {
+                            "M": "16",
+                            "ef_construction": "50",
+                            "metric": "cosine",
+                            "encode": "lvq",
+                        },
+                    ),
+                    ConflictType.Ignore,
+                )
+                logger.debug(f"INFINITY created vector index q_vec_idx for table {table_name}")
+            except Exception as e:
+                logger.error(f"INFINITY failed to create vector index q_vec_idx for table {table_name}: {str(e)}")
+                raise
+            
+            # 为每个文本字段创建全文索引，每个索引独立处理错误
+            failed_indexes = []
+            for field_name, field_info in schema.items():
+                if field_info["type"] != "varchar" or "analyzer" not in field_info:
+                    continue
+                try:
+                    inf_table.create_index(
+                        f"text_idx_{field_name}",
+                        IndexInfo(field_name, IndexType.FullText, {"ANALYZER": field_info["analyzer"]}),
+                        ConflictType.Ignore,
+                    )
+                    logger.debug(f"INFINITY created text index text_idx_{field_name} for table {table_name}")
+                except Exception as e:
+                    failed_indexes.append(field_name)
+                    logger.error(f"INFINITY failed to create text index text_idx_{field_name} (analyzer={field_info.get('analyzer')}) for table {table_name}: {str(e)}")
+                    # 继续处理其他索引，不中断整个流程
+            
+            if failed_indexes:
+                logger.warning(f"INFINITY created table {table_name} with {len(failed_indexes)} failed indexes: {failed_indexes}")
+            else:
+                logger.info(f"INFINITY created table {table_name}, vector size {vectorSize}")
+        except Exception as e:
+            logger.exception(f"INFINITY createIdx failed for table {table_name}: {str(e)}")
+            raise
+        finally:
+            if inf_conn is not None:
+                try:
+                    self.connPool.release_conn(inf_conn)
+                except Exception as e:
+                    logger.warning(f"INFINITY failed to release connection for table {table_name}: {str(e)}")
 
     def deleteIdx(self, indexName: str, knowledgebaseId: str):
         table_name = f"{indexName}_{knowledgebaseId}"
@@ -511,6 +541,10 @@ class InfinityConnection(DocStoreConnection):
         for d in docs:
             assert "_id" not in d
             assert "id" in d
+            # 移除不在 schema 中的字段（用于内部逻辑，不需要插入数据库）
+            # chunk_type: 用于 task_executor.py 区分段落级和章节级，插入前移除
+            if "chunk_type" in d:
+                del d["chunk_type"]
             for k, v in d.items():
                 if field_keyword(k):
                     if isinstance(v, list):
@@ -547,6 +581,174 @@ class InfinityConnection(DocStoreConnection):
         self.connPool.release_conn(inf_conn)
         logger.debug(f"INFINITY inserted into {table_name} {str_ids}.")
         return []
+    
+    def insert_sections(self, documents: list[dict], indexName: str, knowledgebaseId: str = None) -> list[str]:
+        """
+        插入章节级 chunks 到章节表（不需要向量字段）
+        
+        Args:
+            documents: 章节级 chunk 列表
+            indexName: 索引名称
+            knowledgebaseId: 知识库ID
+        
+        Returns:
+            错误信息列表（空列表表示成功）
+        """
+        if not documents:
+            return []
+        
+        inf_conn = self.connPool.get_conn()
+        db_instance = inf_conn.get_database(self.dbName)
+        table_name = f"{indexName}_{knowledgebaseId}_sections"
+        
+        try:
+            table_instance = db_instance.get_table(table_name)
+        except InfinityException as e:
+            # 如果表不存在，创建章节表（不需要向量字段）
+            if e.error_code != ErrorCode.TABLE_NOT_EXIST:
+                self.connPool.release_conn(inf_conn)
+                raise
+            
+            # 加载 schema（不包含向量字段）
+            fp_mapping = os.path.join(get_project_base_directory(), "conf", "infinity_mapping.json")
+            if not os.path.exists(fp_mapping):
+                self.connPool.release_conn(inf_conn)
+                raise Exception(f"Mapping file not found at {fp_mapping}")
+            schema = json.load(open(fp_mapping))
+            
+            # 创建表（不包含向量字段）
+            inf_table = db_instance.create_table(
+                table_name,
+                schema,
+                ConflictType.Ignore,
+            )
+            
+            # 为文本字段创建全文索引
+            for field_name, field_info in schema.items():
+                if field_info["type"] != "varchar" or "analyzer" not in field_info:
+                    continue
+                inf_table.create_index(
+                    f"text_idx_{field_name}",
+                    IndexInfo(field_name, IndexType.FullText, {"ANALYZER": field_info["analyzer"]}),
+                    ConflictType.Ignore,
+                )
+            
+            table_instance = inf_table
+            logger.info(f"INFINITY created section table {table_name}")
+        
+        # 处理文档数据
+        docs = copy.deepcopy(documents)
+        for d in docs:
+            assert "_id" not in d
+            assert "id" in d
+            # 移除不在 schema 中的字段（用于内部逻辑，不需要插入数据库）
+            # chunk_type: 用于 task_executor.py 区分段落级和章节级，插入前移除
+            if "chunk_type" in d:
+                del d["chunk_type"]
+            # content: 用于内部逻辑（在 _apply_new_chunk_merge_strategy 中使用），不需要插入数据库
+            if "content" in d:
+                del d["content"]
+            # 移除向量字段（章节表不需要向量字段，章节级 chunks 不用于向量检索）
+            vector_fields = [k for k in d.keys() if re.match(r"q_\d+_vec", k)]
+            for k in vector_fields:
+                del d[k]
+            for k, v in d.items():
+                if field_keyword(k):
+                    if isinstance(v, list):
+                        d[k] = "###".join(v)
+                    else:
+                        d[k] = v
+                elif re.search(r"_feas$", k):
+                    d[k] = json.dumps(v)
+                elif k == "kb_id":
+                    if isinstance(d[k], list):
+                        d[k] = d[k][0]
+                elif k == "position_int":
+                    assert isinstance(v, list)
+                    arr = [num for row in v for num in row]
+                    d[k] = "_".join(f"{num:08x}" for num in arr)
+                elif k in ["page_num_int", "top_int"]:
+                    assert isinstance(v, list)
+                    d[k] = "_".join(f"{num:08x}" for num in v)
+                elif k == "paragraph_chunk_ids":
+                    # 章节表特有的字段，存储为 JSON 字符串
+                    if isinstance(v, list):
+                        d[k] = json.dumps(v)
+                    else:
+                        d[k] = v
+                else:
+                    d[k] = v
+        
+        ids = ["'{}'".format(d["id"]) for d in docs]
+        str_ids = ", ".join(ids)
+        str_filter = f"id IN ({str_ids})"
+        table_instance.delete(str_filter)
+        table_instance.insert(docs)
+        self.connPool.release_conn(inf_conn)
+        logger.debug(f"INFINITY inserted into section table {table_name} {str_ids}.")
+        return []
+    
+    def get_sections_by_ids(self, section_ids: list[str], indexName: str, knowledgebaseId: str = None) -> dict[str, dict]:
+        """
+        批量获取章节级 chunks
+        
+        Args:
+            section_ids: 章节 ID 列表
+            indexName: 索引名称
+            knowledgebaseId: 知识库ID
+        
+        Returns:
+            字典，key 为 section_id，value 为章节 chunk 字典
+        """
+        if not section_ids:
+            return {}
+        
+        inf_conn = self.connPool.get_conn()
+        db_instance = inf_conn.get_database(self.dbName)
+        table_name = f"{indexName}_{knowledgebaseId}_sections"
+        
+        try:
+            table_instance = db_instance.get_table(table_name)
+        except InfinityException as e:
+            # 如果表不存在，返回空字典
+            if e.error_code == ErrorCode.TABLE_NOT_EXIST:
+                self.connPool.release_conn(inf_conn)
+                logger.warning(f"Section table {table_name} does not exist")
+                return {}
+            self.connPool.release_conn(inf_conn)
+            raise
+        
+        # 构建查询条件：id IN (...)
+        ids = ["'{}'".format(sid) for sid in section_ids]
+        str_ids = ", ".join(ids)
+        str_filter = f"id IN ({str_ids})"
+        
+        # 查询数据
+        result_df = table_instance.output(["*"]).filter(str_filter).to_df()
+        self.connPool.release_conn(inf_conn)
+        
+        # 转换为字典
+        sections = {}
+        if not result_df.empty:
+            for _, row in result_df.iterrows():
+                section_id = row.get("id", "")
+                if section_id:
+                    # 将 DataFrame 行转换为字典
+                    section_dict = row.to_dict()
+                    # 解析 paragraph_chunk_ids（如果是 JSON 字符串）
+                    if "paragraph_chunk_ids" in section_dict:
+                        para_ids_str = section_dict["paragraph_chunk_ids"]
+                        if para_ids_str and isinstance(para_ids_str, str):
+                            try:
+                                section_dict["paragraph_chunk_ids"] = json.loads(para_ids_str)
+                            except:
+                                section_dict["paragraph_chunk_ids"] = []
+                        elif not para_ids_str:
+                            section_dict["paragraph_chunk_ids"] = []
+                    sections[section_id] = section_dict
+        
+        logger.debug(f"INFINITY retrieved {len(sections)} sections from {table_name}")
+        return sections
 
     def update(self, condition: dict, newValue: dict, indexName: str, knowledgebaseId: str) -> bool:
         # if 'position_int' in newValue:
@@ -650,6 +852,8 @@ class InfinityConnection(DocStoreConnection):
     def getChunkIds(self, res: tuple[pd.DataFrame, int] | pd.DataFrame) -> list[str]:
         if isinstance(res, tuple):
             res = res[0]
+        if res.empty or "id" not in res.columns:
+            return []
         return list(res["id"])
 
     def getFields(self, res: tuple[pd.DataFrame, int] | pd.DataFrame, fields: list[str]) -> dict[str, dict]:

@@ -287,7 +287,7 @@ async def build_chunks(task, progress_callback):
         async with chunk_limiter:
             cks = await trio.to_thread.run_sync(lambda: chunker.chunk(task["name"], binary=binary, from_page=task["from_page"],
                                 to_page=task["to_page"], lang=task["language"], callback=progress_callback,
-                                kb_id=task["kb_id"], parser_config=task["parser_config"], tenant_id=task["tenant_id"]))
+                                kb_id=task["kb_id"], parser_config=task["parser_config"], tenant_id=task["tenant_id"], doc_id=task["doc_id"]))
         logging.info("Chunking({}) {}/{} done".format(timer() - st, task["location"], task["name"]))
     except TaskCanceledException:
         raise
@@ -749,30 +749,63 @@ async def delete_image(kb_id, chunk_id):
 
 
 async def insert_es(task_id, task_tenant_id, task_dataset_id, chunks, progress_callback):
-    for b in range(0, len(chunks), DOC_BULK_SIZE):
-        doc_store_result = await trio.to_thread.run_sync(lambda: settings.docStoreConn.insert(chunks[b:b + DOC_BULK_SIZE], search.index_name(task_tenant_id), task_dataset_id))
-        task_canceled = has_canceled(task_id)
-        if task_canceled:
-            progress_callback(-1, msg="Task has been canceled.")
-            return
-        if b % 128 == 0:
-            progress_callback(prog=0.8 + 0.1 * (b + 1) / len(chunks), msg="")
-        if doc_store_result:
-            error_message = f"Insert chunk error: {doc_store_result}, please check log file and Elasticsearch/Infinity status!"
-            progress_callback(-1, msg=error_message)
-            raise Exception(error_message)
-        chunk_ids = [chunk["id"] for chunk in chunks[:b + DOC_BULK_SIZE]]
-        chunk_ids_str = " ".join(chunk_ids)
-        try:
-            TaskService.update_chunk_ids(task_id, chunk_ids_str)
-        except DoesNotExist:
-            logging.warning(f"do_handle_task update_chunk_ids failed since task {task_id} is unknown.")
+    # 区分段落级和章节级 chunks
+    paragraph_chunks = []
+    section_chunks = []
+    
+    for chunk in chunks:
+        chunk_type = chunk.get("chunk_type", "")
+        if chunk_type == "section":
+            section_chunks.append(chunk)
+        else:
+            paragraph_chunks.append(chunk)
+    
+    # 插入段落级 chunks（用于检索）
+    if paragraph_chunks:
+        for b in range(0, len(paragraph_chunks), DOC_BULK_SIZE):
+            doc_store_result = await trio.to_thread.run_sync(lambda: settings.docStoreConn.insert(paragraph_chunks[b:b + DOC_BULK_SIZE], search.index_name(task_tenant_id), task_dataset_id))
+            task_canceled = has_canceled(task_id)
+            if task_canceled:
+                progress_callback(-1, msg="Task has been canceled.")
+                return
+            if b % 128 == 0:
+                progress_callback(prog=0.8 + 0.1 * (b + 1) / len(paragraph_chunks), msg="")
+            if doc_store_result:
+                error_message = f"Insert paragraph chunk error: {doc_store_result}, please check log file and Elasticsearch/Infinity status!"
+                progress_callback(-1, msg=error_message)
+                raise Exception(error_message)
+    
+    # 插入章节级 chunks（用于返回）
+    if section_chunks:
+        for b in range(0, len(section_chunks), DOC_BULK_SIZE):
+            doc_store_result = await trio.to_thread.run_sync(lambda: settings.docStoreConn.insert_sections(section_chunks[b:b + DOC_BULK_SIZE], search.index_name(task_tenant_id), task_dataset_id))
+            task_canceled = has_canceled(task_id)
+            if task_canceled:
+                progress_callback(-1, msg="Task has been canceled.")
+                return
+            if doc_store_result:
+                error_message = f"Insert section chunk error: {doc_store_result}, please check log file and Elasticsearch/Infinity status!"
+                progress_callback(-1, msg=error_message)
+                raise Exception(error_message)
+    
+    # 更新任务 chunk IDs（只记录段落级 chunks 的 IDs）
+    chunk_ids = [chunk["id"] for chunk in paragraph_chunks]
+    chunk_ids_str = " ".join(chunk_ids)
+    try:
+        TaskService.update_chunk_ids(task_id, chunk_ids_str)
+    except DoesNotExist:
+        logging.warning(f"do_handle_task update_chunk_ids failed since task {task_id} is unknown.")
+        # 删除已插入的 chunks
+        if paragraph_chunks:
             doc_store_result = await trio.to_thread.run_sync(lambda: settings.docStoreConn.delete({"id": chunk_ids}, search.index_name(task_tenant_id), task_dataset_id))
-            async with trio.open_nursery() as nursery:
-                for chunk_id in chunk_ids:
-                    nursery.start_soon(delete_image, task_dataset_id, chunk_id)
-            progress_callback(-1, msg=f"Chunk updates failed since task {task_id} is unknown.")
-            return
+        if section_chunks:
+            section_chunk_ids = [chunk["id"] for chunk in section_chunks]
+            # 注意：章节表的删除需要单独实现，这里先跳过
+        async with trio.open_nursery() as nursery:
+            for chunk_id in chunk_ids:
+                nursery.start_soon(delete_image, task_dataset_id, chunk_id)
+        progress_callback(-1, msg=f"Chunk updates failed since task {task_id} is unknown.")
+        return
     return True
 
 

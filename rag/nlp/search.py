@@ -419,7 +419,9 @@ class Dealer:
                 "term_similarity": tsim[i],
                 "vector": chunk.get(vector_column, zero_vector),
                 "positions": position_int,
-                "doc_type_kwd": chunk.get("doc_type_kwd", "")
+                "doc_type_kwd": chunk.get("doc_type_kwd", ""),
+                "parent_section_id": chunk.get("parent_section_id", ""),  # 用于章节聚合
+                "section_path": chunk.get("section_path", "")  # 章节路径
             }
             if highlight and sres.highlight:
                 if id in sres.highlight:
@@ -436,6 +438,88 @@ class Dealer:
                                                        v in sorted(ranks["doc_aggs"].items(),
                                                                    key=lambda x: x[1]["count"] * -1)]
         ranks["chunks"] = ranks["chunks"][:page_size]
+        
+        # 段落检索 → 章节聚合返回
+        # 如果检索到的是段落级 chunk（有 parent_section_id），则通过 parent_section_id 查找对应的章节级 chunk 并返回
+        if ranks["chunks"]:
+            # 收集所有需要查找的 parent_section_id（去重）
+            parent_section_ids = set()
+            paragraph_chunk_map = {}  # {parent_section_id: [chunk_dict, ...]}
+            
+            for chunk in ranks["chunks"]:
+                parent_section_id = chunk.get("parent_section_id", "")
+                if parent_section_id:
+                    parent_section_ids.add(parent_section_id)
+                    if parent_section_id not in paragraph_chunk_map:
+                        paragraph_chunk_map[parent_section_id] = []
+                    paragraph_chunk_map[parent_section_id].append(chunk)
+            
+            # 如果有需要查找的章节，批量获取章节级 chunks
+            if parent_section_ids:
+                # 获取 tenant_id 和 kb_id（从第一个 chunk 中获取）
+                first_chunk = ranks["chunks"][0]
+                kb_id = first_chunk.get("kb_id", "")
+                
+                # 从 kb_id 推断 tenant_id（需要从 kb_ids 参数中获取，但这里简化处理）
+                # 实际上，我们需要从 kb_ids 中找到对应的 tenant_id
+                # 这里假设 kb_ids 列表中的第一个就是当前使用的 kb_id
+                if isinstance(kb_ids, list) and len(kb_ids) > 0:
+                    # 从 kb_ids 中找到对应的 tenant_id
+                    # 这里简化处理，假设 tenant_ids 和 kb_ids 一一对应
+                    if isinstance(tenant_ids, list) and len(tenant_ids) > 0:
+                        tenant_id = tenant_ids[0]
+                    elif isinstance(tenant_ids, str):
+                        tenant_id = tenant_ids.split(",")[0] if "," in tenant_ids else tenant_ids
+                    else:
+                        tenant_id = None
+                    
+                    if tenant_id:
+                        # 批量获取章节级 chunks
+                        from rag.nlp import search as search_module
+                        section_chunks = self.dataStore.get_sections_by_ids(
+                            list(parent_section_ids),
+                            search_module.index_name(tenant_id),
+                            kb_id
+                        )
+                        
+                        # 替换段落级 chunks 为章节级 chunks（去重）
+                        aggregated_chunks = []
+                        seen_section_ids = set()
+                        
+                        for chunk in ranks["chunks"]:
+                            parent_section_id = chunk.get("parent_section_id", "")
+                            if parent_section_id and parent_section_id in section_chunks:
+                                # 如果该章节还没有被添加过，添加章节级 chunk
+                                if parent_section_id not in seen_section_ids:
+                                    section_chunk = section_chunks[parent_section_id]
+                                    # 构建返回格式
+                                    section_chunk_dict = {
+                                        "chunk_id": section_chunk.get("id", ""),
+                                        "content_ltks": section_chunk.get("content_ltks", ""),
+                                        "content_with_weight": section_chunk.get("content_with_weight", ""),
+                                        "doc_id": section_chunk.get("doc_id", ""),
+                                        "docnm_kwd": section_chunk.get("docnm_kwd", ""),
+                                        "kb_id": section_chunk.get("kb_id", ""),
+                                        "important_kwd": section_chunk.get("important_kwd", []),
+                                        "image_id": section_chunk.get("img_id", ""),
+                                        "similarity": chunk.get("similarity", 0.0),  # 使用段落 chunk 的相似度
+                                        "vector_similarity": chunk.get("vector_similarity", 0.0),
+                                        "term_similarity": chunk.get("term_similarity", 0.0),
+                                        "vector": chunk.get("vector", []),  # 章节 chunk 没有向量，使用段落 chunk 的向量
+                                        "positions": chunk.get("positions", []),
+                                        "doc_type_kwd": section_chunk.get("doc_type_kwd", ""),
+                                        "section_path": section_chunk.get("section_path", "")
+                                    }
+                                    if highlight and "highlight" in chunk:
+                                        section_chunk_dict["highlight"] = chunk.get("highlight", "")
+                                    aggregated_chunks.append(section_chunk_dict)
+                                    seen_section_ids.add(parent_section_id)
+                            else:
+                                # 没有 parent_section_id 的 chunk，直接添加（可能是其他类型的 chunk）
+                                aggregated_chunks.append(chunk)
+                        
+                        # 更新 ranks["chunks"]
+                        ranks["chunks"] = aggregated_chunks[:page_size]
 
         return ranks
 

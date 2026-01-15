@@ -194,6 +194,7 @@ def get_title_pattern_info(title_text: str) -> tuple:
         return (0, None)
     
     # 先检查其他模式（不需要前导空格）
+    # 跳过模式0（索引0），从模式1a开始检查
     for pattern, priority, dot_count in TITLE_PATTERNS[1:]:
         match = re.match(pattern, content)
         if match and not not_bullet(content):
@@ -228,7 +229,7 @@ def is_valid_title(title_text: str) -> bool:
     return get_title_pattern_priority(title_text) >= 0
 
 
-def adjust_title_levels(titles: list) -> list:
+def adjust_title_levels(titles: list) -> tuple:
     """
     调整标题层级：完全按照标题模式优先级确定绝对Level，不考虑markdown层级
     
@@ -236,10 +237,12 @@ def adjust_title_levels(titles: list) -> list:
         titles: 标题列表，每个元素包含 'content', 'level', 'line', 'file'
     
     Returns:
-        调整后的标题列表
+        (adjusted_titles, has_conflict) 元组
+        adjusted_titles: 调整后的标题列表
+        has_conflict: 是否存在模式0和模式1在同一Level的冲突
     """
     if not titles:
-        return titles
+        return titles, False
     
     adjusted_titles = titles.copy()
     
@@ -258,7 +261,7 @@ def adjust_title_levels(titles: list) -> list:
     
     if not valid_titles:
         # 所有标题都没有匹配模式，保持原层级
-        return adjusted_titles
+        return adjusted_titles, False
     
     # 对于模式0，只保留紧挨在模式2（"一、"）之前的匹配标题
     # 如果有多个"一、"标题，每个"一、"之前如果有匹配模式0的标题都要保留
@@ -374,7 +377,7 @@ def adjust_title_levels(titles: list) -> list:
     # 只返回过滤后的标题（从valid_titles中提取）
     filtered_adjusted_titles = [title for idx, title, priority, dot_count in valid_titles]
     
-    return filtered_adjusted_titles
+    return filtered_adjusted_titles, has_conflict
 
 
 def extract_titles_from_markdown(markdown_content: str) -> list:
@@ -840,20 +843,58 @@ class CustomPdfParser:
         """从对象存储获取缓存的OCR结果（按文档目录结构组织）"""
         try:
             bucket = self.result_cache_bucket
-            # 按文档目录结构：{md5}/markdown/{md5}.md 或 {md5}/json/{md5}.json
             if self.ocr_type == "paddleocr":
-                cache_key = f"{md5}/markdown/{md5}.md"
+                # PaddleOCR: 按照 paddle_ocr.py 的目录结构读取每页的 JSON 文件并合并
+                # 目录结构：{md5}/json/{md5}_page{page_idx:03d}.json
+                logger.debug(f"[缓存] 从每页JSON文件读取并合并: MD5={md5}")
+                all_pruned_results = []
+                page_idx = 0
+                while True:
+                    json_key = f"{md5}/json/{md5}_page{page_idx:03d}.json"
+                    if not STORAGE_IMPL.obj_exist(bucket, json_key):
+                        break
+                    json_binary = STORAGE_IMPL.get(bucket, json_key)
+                    try:
+                        pruned_result = json.loads(json_binary.decode('utf-8'))
+                        all_pruned_results.append(pruned_result)
+                    except Exception as e:
+                        logger.warning(f"[缓存] 解析页面JSON失败: {json_key}, 错误: {e}")
+                    page_idx += 1
+                
+                if all_pruned_results:
+                    # 构建统一的 JSON 结构（与 _call_ocr_api 保持一致）
+                    merged_json = {
+                        "prunedResult": {
+                            "model_settings": all_pruned_results[0].get("model_settings", {}) if all_pruned_results else {},
+                            "parsing_res_list": []
+                        }
+                    }
+                    
+                    # 合并所有页面的 parsing_res_list，并添加页码信息
+                    for page_idx, pruned_result in enumerate(all_pruned_results):
+                        parsing_res_list = pruned_result.get("parsing_res_list", [])
+                        for block in parsing_res_list:
+                            # 添加页码信息到每个 block
+                            block_with_page = block.copy()
+                            block_with_page["page_index"] = page_idx + 1  # 页码从1开始
+                            merged_json["prunedResult"]["parsing_res_list"].append(block_with_page)
+                    
+                    result_binary = json.dumps(merged_json, ensure_ascii=False).encode('utf-8')
+                    logger.info(f"[缓存] ✓ OCR结果缓存命中: MD5={md5}, OCR类型={self.ocr_type}, 大小={len(result_binary)} bytes, 共 {len(all_pruned_results)} 页")
+                    return result_binary
+                else:
+                    logger.debug(f"[缓存] ✗ OCR结果缓存未命中: MD5={md5}, OCR类型={self.ocr_type}")
             else:
+                # Textin: 读取 JSON 文件
                 cache_key = f"{md5}/json/{md5}.json"
-            
-            logger.debug(f"[缓存] 检查OCR结果缓存: bucket={bucket}, key={cache_key}, OCR类型={self.ocr_type}")
-            
-            if STORAGE_IMPL.obj_exist(bucket, cache_key):
-                result_binary = STORAGE_IMPL.get(bucket, cache_key)
-                logger.info(f"[缓存] ✓ OCR结果缓存命中: MD5={md5}, OCR类型={self.ocr_type}, 大小={len(result_binary)} bytes")
-                return result_binary
-            else:
-                logger.debug(f"[缓存] ✗ OCR结果缓存未命中: MD5={md5}, OCR类型={self.ocr_type}")
+                logger.debug(f"[缓存] 检查OCR结果缓存: bucket={bucket}, key={cache_key}, OCR类型={self.ocr_type}")
+                
+                if STORAGE_IMPL.obj_exist(bucket, cache_key):
+                    result_binary = STORAGE_IMPL.get(bucket, cache_key)
+                    logger.info(f"[缓存] ✓ OCR结果缓存命中: MD5={md5}, OCR类型={self.ocr_type}, 大小={len(result_binary)} bytes")
+                    return result_binary
+                else:
+                    logger.debug(f"[缓存] ✗ OCR结果缓存未命中: MD5={md5}, OCR类型={self.ocr_type}")
         except Exception as e:
             logger.warning(f"[缓存] 获取OCR结果缓存失败: MD5={md5}, OCR类型={self.ocr_type}, 错误: {e}", exc_info=True)
         return None
@@ -886,14 +927,8 @@ class CustomPdfParser:
             logger.info(f"[缓存] 保存OCR结果到缓存: bucket={bucket}, OCR类型={self.ocr_type}")
             
             if self.ocr_type == "paddleocr":
-                # PaddleOCR: 保存markdown和图片
-                # 保存主markdown文件
-                md_key = f"{md5}/markdown/{md5}.md"
-                logger.debug(f"[缓存] 保存Markdown到缓存: bucket={bucket}, key={md_key}, 大小={len(result_binary)} bytes")
-                STORAGE_IMPL.put(bucket, md_key, result_binary)
-                logger.info(f"[缓存] ✓ Markdown保存成功: {bucket}/{md_key}")
-                
-                # 如果有完整响应，保存JSON和图片
+                # PaddleOCR: 按照 paddle_ocr.py 的目录结构保存每页的 JSON 文件
+                # 目录结构：{md5}/json/{md5}_page{page_idx:03d}.json
                 if full_response:
                     layout_results = full_response.get("result", {}).get("layoutParsingResults", [])
                     
@@ -1337,6 +1372,25 @@ class CustomPdfParser:
                 logger.warning(f"[PaddleOCR JSON解析] JSON文件 {filename} 的parsing_res_list字段不是列表类型")
                 return []
             
+            # 从文件名提取页码并添加到每个 block（如果 block 没有 page_index）
+            # 优先使用 block 中的 _source_filename（如果存在，说明是合并后的 JSON，需要从原始文件名提取）
+            # 否则使用传入的 filename
+            import re
+            for block in parsing_res_list:
+                if 'page_index' not in block or block.get('page_index', 0) == 0:
+                    # 优先使用 block 中的 _source_filename（合并后的 JSON）
+                    source_filename = block.get('_source_filename', filename)
+                    page_match = re.search(r'_page(\d+)', source_filename)
+                    if page_match:
+                        page_index = int(page_match.group(1)) + 1  # 页码从1开始
+                        block['page_index'] = page_index
+                    else:
+                        # 如果文件名中没有页码，使用默认值1
+                        block['page_index'] = 1
+                # 删除临时字段 _source_filename（不再需要）
+                if '_source_filename' in block:
+                    del block['_source_filename']
+            
             logger.info(f"[PaddleOCR JSON解析] parsing_res_list包含 {len(parsing_res_list)} 个block")
             
             # 提取标题层级和段落
@@ -1422,8 +1476,52 @@ class CustomPdfParser:
         paragraphs = []
         sections = []
         
-        # 动态 level 映射：{(priority, dot_count): level}
+        # 第一遍：收集所有标题，用于统一分配层级（与 gen_title_report.py 保持一致）
+        title_blocks = []
+        for idx, block in enumerate(blocks):
+            block_label = block.get("block_label", "")
+            # 保留标题内容中的前导空格（用于匹配模式0），只去掉尾随空格（与 gen_title_report.py 保持一致）
+            block_content = block.get("block_content", "").rstrip()
+            if block_label == "paragraph_title" and block_content:
+                # 与 gen_title_report.py 保持一致：只使用 is_valid_title 过滤
+                # 过滤掉空标题（已在上面检查）
+                # 过滤掉没有匹配任何标题模式的标题（通过 is_valid_title）
+                if is_valid_title(block_content):
+                    # 计算行号：直接从 block 获取 page_index 和 block_order/block_id
+                    # 每个 block 都有 page_index（在 _call_ocr_api 中已添加，或从 pagexxx 文件读取时已添加）
+                    page_index = block.get("page_index", 1)
+                    block_order = block.get("block_order")
+                    block_id = block.get("block_id", 0)
+                    # 使用 page_index * 10000 + block_order/block_id 作为行号
+                    if block_order is not None:
+                        line_num = page_index * 10000 + block_order
+                    elif block_id > 0:
+                        line_num = page_index * 10000 + block_id
+                    else:
+                        line_num = page_index * 10000 + 1
+                    
+                    title_blocks.append({
+                        'content': block_content,
+                        'level': 2,  # 临时值，会被 adjust_title_levels 覆盖
+                        'line': line_num,  # 使用 page_index 和 block 顺序计算行号
+                        'file': filename,
+                        'block': block  # 保存原始 block 引用
+                    })
+        
+        # 使用 adjust_title_levels 统一分配层级（与 gen_title_report.py 保持一致）
         pattern_to_level: Dict[Tuple[int, Optional[int]], int] = {}
+        
+        if title_blocks:
+            adjusted_titles, has_conflict = adjust_title_levels(title_blocks)
+            # 创建 (priority, dot_count) 到 level 的映射
+            # 注意：adjust_title_levels 返回的 level 从 2 开始（对应 markdown 的 ##），
+            # 我们直接使用这个 level，在路径构建时 level 2 对应路径深度 0，level 3 对应路径深度 1，以此类推
+            for title_info in adjusted_titles:
+                priority, dot_count = get_title_pattern_info(title_info['content'])
+                pattern_key = (priority, dot_count)
+                # adjust_title_levels 返回的 level 从 2 开始（Level 2=##, Level 3=###, Level 4=####）
+                # 在路径构建时，level 2 对应路径深度 0（顶级），level 3 对应路径深度 1，以此类推
+                pattern_to_level[pattern_key] = title_info['level']
         
         # 当前章节路径（用于构建 section_path）
         current_section_path: List[str] = []
@@ -1431,6 +1529,9 @@ class CustomPdfParser:
         # 当前章节信息
         current_section: Optional[Dict[str, Any]] = None
         current_section_paragraph_ids: List[str] = []
+        
+        # 保存上一个标题的 level（用于判断是同级标题还是子级标题）
+        last_title_level: Optional[int] = None
         
         # 跨页段落拼接：存储上一个页面的最后一个 text block
         last_text_block: Optional[Dict[str, Any]] = None
@@ -1441,16 +1542,24 @@ class CustomPdfParser:
         
         for block in blocks:
             block_label = block.get("block_label", "")
-            block_content = block.get("block_content", "").strip()
             page_index = block.get("page_index", 1)
             block_id = block.get("block_id", 0)
             
-            # 跳过空内容
-            if not block_content:
-                continue
-            
             # 处理标题（paragraph_title）
             if block_label == "paragraph_title":
+                # 对于标题，保留前导空格（用于匹配模式0），只去掉尾随空格（与 gen_title_report.py 保持一致）
+                block_content = block.get("block_content", "").rstrip()
+                
+                # 跳过空内容
+                if not block_content:
+                    continue
+                
+                # 与 gen_title_report.py 保持一致：只使用 is_valid_title 过滤
+                # 如果标题不匹配任何模式，跳过（通过 adjust_title_levels 会过滤掉）
+                # 但这里需要先检查，确保只处理有效的标题
+                if not is_valid_title(block_content):
+                    continue
+                
                 # 先处理上一个未完成的段落（如果有）
                 if last_text_block:
                     paragraph_counter += 1
@@ -1469,20 +1578,48 @@ class CustomPdfParser:
                     last_page_index = None
                 
                 # 处理当前标题
-                # 获取标题的模式信息
+                # 获取标题的模式信息（block_content 已保留前导空格）
                 priority, dot_count = get_title_pattern_info(block_content)
                 
                 if priority >= 0:  # 匹配到有效模式
-                    # 动态判定 level
-                    level = self._determine_title_level_dynamic(block_content, priority, dot_count, pattern_to_level)
+                    # 使用统一分配的 level（与 gen_title_report.py 保持一致）
+                    pattern_key = (priority, dot_count)
+                    if pattern_key in pattern_to_level:
+                        level = pattern_to_level[pattern_key]
+                    else:
+                        # 如果模式不在映射中（理论上不应该发生），使用动态分配作为后备
+                        level = self._determine_title_level_dynamic(block_content, priority, dot_count, pattern_to_level)
                     
                     # 更新章节路径
-                    # 如果新标题的 level 小于等于当前路径长度，需要截断路径
-                    while len(current_section_path) >= level:
+                    # adjust_title_levels 返回的 level 从 2 开始（Level 2=##, Level 3=###, Level 4=####）
+                    # 路径深度 = level - 2（Level 2 对应深度 0，Level 3 对应深度 1，以此类推）
+                    path_depth = level - 2
+                    
+                    # 如果新标题的路径深度小于当前路径长度，需要截断路径
+                    while len(current_section_path) > path_depth:
                         current_section_path.pop()
                     
-                    # 添加新标题到路径
-                    current_section_path.append(block_content)
+                    # 判断是同级标题还是子级标题
+                    # 如果 path_depth == len(current_section_path) 且 last_title_level == level，说明是同级标题，需要替换最后一个
+                    # 否则，说明是子级标题或更高级的标题，需要追加或替换
+                    if (len(current_section_path) == path_depth and 
+                        len(current_section_path) > 0 and 
+                        last_title_level is not None and 
+                        last_title_level == level):
+                        # 同级标题，替换最后一个
+                        current_section_path[-1] = block_content
+                    else:
+                        # 子级标题或更高级的标题，追加到路径
+                        # 如果 path_depth == len(current_section_path)，说明是子级标题，追加
+                        # 如果 path_depth < len(current_section_path)，说明是更高级的标题，已经通过上面的 while 循环截断了，现在追加
+                        if len(current_section_path) == path_depth:
+                            current_section_path.append(block_content)
+                        else:
+                            # 这种情况理论上不应该发生，但为了安全起见，还是追加
+                            current_section_path.append(block_content)
+                    
+                    # 保存当前标题的 level，用于下一个标题的判断
+                    last_title_level = level
                     
                     # 创建新章节
                     section_id = hashlib.md5(" > ".join(current_section_path).encode('utf-8')).hexdigest()
@@ -1493,10 +1630,24 @@ class CustomPdfParser:
                         sections.append(current_section)
                     
                     # 创建新章节
+                    # 获取当前标题的行号（直接从 block 计算，不依赖 title_content_to_line）
+                    # 每个 block 都有 page_index（在 _call_ocr_api 中已添加，或从 pagexxx 文件读取时已添加）
+                    block_page_index = block.get("page_index", 1)
+                    block_order = block.get("block_order")
+                    block_id = block.get("block_id", 0)
+                    if block_order is not None:
+                        last_title_line = block_page_index * 10000 + block_order
+                    elif block_id > 0:
+                        last_title_line = block_page_index * 10000 + block_id
+                    else:
+                        last_title_line = block_page_index * 10000 + 1
+                    
                     current_section = {
                         "section_id": section_id,
                         "section_path": current_section_path.copy(),
                         "level": level,
+                        "page_index": page_index,  # 保存标题出现的页码（用于与 gen_title_report.py 保持一致）
+                        "line": last_title_line,  # 保存最后一个标题的行号（用于与 gen_title_report.py 保持一致）
                         "paragraph_chunk_ids": [],
                         "content": ""  # 内容会在后续段落中填充
                     }
@@ -1506,6 +1657,13 @@ class CustomPdfParser:
             
             # 处理段落（text）和摘要（abstract）
             elif block_label == "text" or block_label == "abstract":
+                # 对于段落内容，去掉所有前后空格
+                block_content = block.get("block_content", "").strip()
+                
+                # 跳过空内容
+                if not block_content:
+                    continue
+                
                 # 检查是否需要跨页拼接（只有跨页且中间没有 paragraph_title 时才合并）
                 if last_text_block and last_page_index and page_index == last_page_index + 1:
                     # 跨页拼接：将上一个页面的最后一个 text 和当前页面的第一个 text 合并
@@ -1631,7 +1789,6 @@ class CustomPdfParser:
             chunk = {
                 "id": chunk_id,
                 "content_with_weight": content_with_weight,
-                "content": content,  # 原始段落内容（用于向量化）
                 "page_num_int": [page_index],  # 列表格式
                 "parent_section_id": parent_section_id or "",
                 "section_path": section_path_str,  # 章节路径字符串
@@ -1670,6 +1827,9 @@ class CustomPdfParser:
             section_path = section.get("section_path", [])
             content = section.get("content", "").strip()  # 可能为空，将在 _apply_paper_merge_strategy 中填充
             paragraph_chunk_ids = section.get("paragraph_chunk_ids", [])
+            level = section.get("level", 2)  # 获取标题层级（从 adjust_title_levels 分配）
+            page_index = section.get("page_index", 1)  # 获取标题出现的页码（与 gen_title_report.py 保持一致）
+            line = section.get("line", 0)  # 获取最后一个标题的行号（与 gen_title_report.py 保持一致）
             
             if not section_id:
                 return None
@@ -1687,17 +1847,18 @@ class CustomPdfParser:
             chunk = {
                 "id": section_id,
                 "content_with_weight": content_with_weight,
-                "content": content,  # 章节内容（用于向量化，但不会被检索）
                 "parent_section_id": "",  # 章节级 chunk 没有父章节
                 "section_path": section_path_str,  # 章节路径字符串
                 "paragraph_chunk_ids": paragraph_chunk_ids,  # 关联的段落 chunk IDs
                 "chunk_type": "section",  # 标记为章节级 chunk
+                "level": level,  # 标题层级（从 adjust_title_levels 分配，与 gen_title_report.py 保持一致）
+                "line": line,  # 最后一个标题的行号（与 gen_title_report.py 保持一致）
                 "docnm_kwd": base_doc.get("docnm_kwd", ""),
                 "title_tks": base_doc.get("title_tks", ""),
                 "title_sm_tks": base_doc.get("title_sm_tks", ""),
                 "doc_id": kwargs.get("doc_id", ""),
                 "kb_id": kwargs.get("kb_id", ""),
-                "page_num_int": [],  # 章节级 chunk 可能跨多页
+                "page_num_int": [page_index],  # 使用标题出现的页码（与 gen_title_report.py 保持一致）
                 "position_int": [],
                 "top_int": [],
                 "doc_type_kwd": "text"  # 标记为文本类型
@@ -2149,7 +2310,6 @@ class CustomPdfParser:
             else:
                 section_chunk['content_with_weight'] = section_content
             
-            section_chunk['content'] = section_content
             processed_section_chunks.append(section_chunk)
         
         # 处理没有 section_path 的段落：聚合到一个"无标题章节"中
@@ -2177,7 +2337,6 @@ class CustomPdfParser:
             no_title_section_chunk = {
                 "id": no_title_section_id,
                 "content_with_weight": no_title_content,
-                "content": no_title_content,
                 "parent_section_id": "",
                 "section_path": "",
                 "paragraph_chunk_ids": no_title_paragraph_ids,
@@ -2431,6 +2590,17 @@ def chunk(filename: str, binary: Optional[bytes] = None, from_page: int = 0, to_
         
         # 过滤掉标题类型的chunks，只返回文本内容
         filtered_chunks = [c for c in processed_chunks if c.get("doc_type_kwd") != "title"]
+        
+        # 移除不在 schema 中的字段（用于内部逻辑，不需要插入数据库）
+        # level: 标题层级，只在章节级 chunk 中，不需要存储
+        # line: 标题行号，只在章节级 chunk 中，不需要存储
+        # chunk_type: 保留用于 task_executor.py 区分段落级和章节级，在 infinity_conn.py 的 insert 方法中移除
+        fields_to_remove = ["level", "line"]
+        for chunk in filtered_chunks:
+            for field in fields_to_remove:
+                if field in chunk:
+                    del chunk[field]
+        
         return filtered_chunks
         
     except Exception as e:
