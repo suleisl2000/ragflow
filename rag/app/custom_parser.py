@@ -713,8 +713,46 @@ class CustomPdfParser:
         logger.info("Keyword cache cleared")
     
     def _init_ocr_config(self):
-        """初始化OCR配置，默认使用 PaddleOCR，支持 Textin 作为备选，优先级：环境变量 > 配置文件 > custom_config"""
+        """初始化OCR配置，默认使用 PaddleOCR，支持 Textin 作为备选，优先级：custom_config.ocr_type > 环境变量 > 配置文件 > custom_config"""
         try:
+            # 优先从 custom_config 中读取 ocr_type（用于 JSON 解析，不需要 OCR 客户端）
+            explicit_ocr_type = self.custom_config.get('ocr_type')
+            if explicit_ocr_type:
+                self.ocr_type = explicit_ocr_type
+                logger.info(f"OCR type set from custom_config: {explicit_ocr_type}")
+                # 如果指定了 ocr_type，仍然尝试初始化 OCR 客户端（用于 PDF 解析）
+                if explicit_ocr_type == "paddleocr":
+                    paddle_api_url = (
+                        os.getenv('PADDLE_OCR_API_URL') or
+                        self.custom_config.get('paddle_ocr_api_url') or
+                        "http://localhost:8080/layout-parsing"
+                    )
+                    try:
+                        self.ocr_client = PaddleOCRClient(paddle_api_url)
+                        logger.info(f"PaddleOCR client initialized with API URL: {paddle_api_url}")
+                    except Exception as e:
+                        logger.warning(f"PaddleOCR client initialization failed (will use for JSON parsing only): {e}")
+                        self.ocr_client = None
+                elif explicit_ocr_type == "textin":
+                    # Textin OCR 配置
+                    app_id = (
+                        os.getenv('TEXTIN_OCR_APP_ID') or
+                        self.custom_config.get('ocr_app_id')
+                    )
+                    secret_code = (
+                        os.getenv('TEXTIN_OCR_SECRET_CODE') or
+                        self.custom_config.get('ocr_secret_code')
+                    )
+                    if app_id and secret_code:
+                        try:
+                            self.ocr_client = TextinOCRClient(app_id, secret_code)
+                            logger.info(f"Textin OCR client initialized")
+                        except Exception as e:
+                            logger.warning(f"Textin OCR client initialization failed (will use for JSON parsing only): {e}")
+                            self.ocr_client = None
+                return
+            
+            # 如果没有明确指定 ocr_type，使用原有逻辑
             # 读取配置文件中的 OCR 配置
             ocr_config = {}
             try:
@@ -1020,9 +1058,7 @@ class CustomPdfParser:
                     raise ValueError("Textin OCR API response missing 'result' field")
             
             elif self.ocr_type == "paddleocr":
-                # PaddleOCR API 调用，需要获取完整响应以提取图片
-                # 使用PaddleOCRClient的recognize方法，但需要获取完整响应
-                # 所以直接调用API而不是使用recognize方法
+                # PaddleOCR API 调用，返回 JSON 数据
                 file_base64 = base64.b64encode(pdf_binary).decode('utf-8')
                 
                 # 判断文件类型：0=PDF, 1=图片（与paddle_ocr.py保持一致）
@@ -1048,22 +1084,38 @@ class CustomPdfParser:
                     error_msg = result_data.get("errorMsg", "Unknown error")
                     raise ValueError(f"PaddleOCR API error: {error_msg}")
                 
-                # 提取markdown文本
+                # 提取 JSON 数据（prunedResult）
                 layout_results = result_data.get("result", {}).get("layoutParsingResults", [])
-                markdown_parts = []
+                # 合并所有页面的 prunedResult
+                all_pruned_results = []
                 for res in layout_results:
-                    markdown_data = res.get("markdown", {})
-                    markdown_text = markdown_data.get("text", "")
-                    if markdown_text:
-                        # 图片路径保持原样：markdown/imgs/（不需要修正）
-                        markdown_parts.append(markdown_text)
+                    pruned_result = res.get("prunedResult", {})
+                    if pruned_result:
+                        all_pruned_results.append(pruned_result)
                 
-                merged_markdown = "\n\n".join(markdown_parts)
+                # 构建统一的 JSON 结构
+                merged_json = {
+                    "prunedResult": {
+                        "model_settings": all_pruned_results[0].get("model_settings", {}) if all_pruned_results else {},
+                        "parsing_res_list": []
+                    }
+                }
+                
+                # 合并所有页面的 parsing_res_list，并添加页码信息
+                for page_idx, pruned_result in enumerate(all_pruned_results):
+                    parsing_res_list = pruned_result.get("parsing_res_list", [])
+                    for block in parsing_res_list:
+                        # 添加页码信息到每个 block
+                        block_with_page = block.copy()
+                        block_with_page["page_index"] = page_idx + 1  # 页码从1开始
+                        merged_json["prunedResult"]["parsing_res_list"].append(block_with_page)
+                
+                result_json = json.dumps(merged_json, ensure_ascii=False).encode('utf-8')
                 ocr_duration = time.time() - ocr_start
-                logger.info(f"[OCR API] PaddleOCR 调用成功，耗时: {ocr_duration:.2f}秒，markdown大小: {len(merged_markdown)} 字符")
+                logger.info(f"[OCR API] PaddleOCR 调用成功，耗时: {ocr_duration:.2f}秒，JSON大小: {len(result_json)} bytes，共 {len(all_pruned_results)} 页")
                 
-                # 返回markdown文本和完整响应
-                return merged_markdown.encode('utf-8'), result_data
+                # 返回 JSON 数据和完整响应
+                return result_json, result_data
             else:
                 raise ValueError(f"Unknown OCR type: {self.ocr_type}")
                 
@@ -1125,14 +1177,15 @@ class CustomPdfParser:
             return self._parse_pdf_file(filename, binary, **kwargs)
         elif filename.lower().endswith('.json'):
             logger.info(f"[解析入口] 识别为JSON文件，调用JSON解析流程")
-            return self._parse_json_file(filename, binary, **kwargs)
-        elif filename.lower().endswith(('.md', '.markdown')):
-            logger.info(f"[解析入口] 识别为Markdown文件，调用Markdown解析流程")
-            markdown_content = binary.decode('utf-8')
-            return self._parse_markdown_file(filename, markdown_content, **kwargs)
+            # 判断是 Textin JSON 还是 PaddleOCR JSON
+            # 根据 ocr_type 决定使用哪个解析方法
+            if self.ocr_type == "paddleocr":
+                return self._parse_paddleocr_json_file(filename, binary, **kwargs)
+            else:
+                return self._parse_json_file(filename, binary, **kwargs)
         else:
             # 对于不支持的文件类型，返回空列表
-            logger.warning(f"[解析入口] Custom parser仅支持PDF、JSON和Markdown文件，当前文件: {filename} (扩展名: {file_ext})")
+            logger.warning(f"[解析入口] Custom parser仅支持PDF和JSON文件，当前文件: {filename} (扩展名: {file_ext})")
             return []
     
     def _parse_pdf_file(self, filename: str, binary: bytes, **kwargs) -> List[Dict[str, Any]]:
@@ -1155,9 +1208,8 @@ class CustomPdfParser:
                 
                 # 根据 OCR 类型解析缓存
                 if self.ocr_type == "paddleocr":
-                    # PaddleOCR 缓存的是 markdown 文本
-                    markdown_content = cached_result.decode('utf-8')
-                    chunks = self._parse_markdown_file(filename, markdown_content, **kwargs)
+                    # PaddleOCR 缓存的是 JSON 数据
+                    chunks = self._parse_paddleocr_json_file(filename, cached_result, **kwargs)
                 else:
                     # Textin 缓存的是 JSON
                     chunks = self._parse_json_file(filename, cached_result, **kwargs)
@@ -1187,9 +1239,8 @@ class CustomPdfParser:
             # 5. 解析结果
             logger.info(f"[PDF解析] 开始解析OCR返回的结果")
             if self.ocr_type == "paddleocr":
-                # PaddleOCR 返回的是 markdown 文本
-                markdown_content = result_binary.decode('utf-8')
-                chunks = self._parse_markdown_file(filename, markdown_content, **kwargs)
+                # PaddleOCR 返回的是 JSON 数据
+                chunks = self._parse_paddleocr_json_file(filename, result_binary, **kwargs)
             else:
                 # Textin 返回的是 JSON
                 chunks = self._parse_json_file(filename, result_binary, **kwargs)
@@ -1257,115 +1308,406 @@ class CustomPdfParser:
             logger.error(f"[JSON解析] 处理JSON文件 {filename} 时发生错误: {str(e)}", exc_info=True)
             return []
     
-    def _parse_markdown_file(self, filename: str, markdown_content: str, **kwargs) -> List[Dict[str, Any]]:
+    def _parse_paddleocr_json_file(self, filename: str, json_binary: bytes, **kwargs) -> List[Dict[str, Any]]:
         """
-        解析 Markdown 格式文件（PaddleOCR 输出）
-        基于 gen_title_report.py 的逻辑处理标题层级
+        解析 PaddleOCR JSON 格式文件
+        从 JSON 数据中提取标题层级和段落，生成段落级和章节级 chunks
         """
         try:
-            logger.info(f"[Markdown解析] 开始解析Markdown文件: {filename}, 内容大小: {len(markdown_content)} 字符")
+            logger.info(f"[PaddleOCR JSON解析] 开始解析JSON文件: {filename}, JSON大小: {len(json_binary)} bytes")
+            
+            # 解析JSON数据
+            json_data = json.loads(json_binary.decode('utf-8'))
+            logger.info(f"[PaddleOCR JSON解析] JSON解析成功，根对象类型: {type(json_data).__name__}")
             
             # 重置章节状态
             self.title_hierarchy = []
             self.current_hierarchy = []
-            logger.info(f"[Markdown解析] 章节层级状态已重置")
+            logger.info(f"[PaddleOCR JSON解析] 章节层级状态已重置")
             
-            # 使用 gen_title_report.py 的逻辑提取标题
-            titles = extract_titles_from_markdown(markdown_content)
-            logger.info(f"[Markdown解析] 提取了 {len(titles)} 个标题")
+            # 检查JSON格式
+            if not isinstance(json_data, dict) or 'prunedResult' not in json_data:
+                logger.warning(f"[PaddleOCR JSON解析] JSON文件 {filename} 格式不正确，缺少prunedResult字段")
+                return []
             
-            # 调整标题层级（基于标题模式优先级）
-            titles = adjust_title_levels(titles)
-            logger.info(f"[Markdown解析] 标题层级调整完成")
+            pruned_result = json_data.get('prunedResult', {})
+            parsing_res_list = pruned_result.get('parsing_res_list', [])
             
-            # 构建标题层级映射（用于后续处理）
-            title_map = {}  # {line_num: title_info}
-            for title in titles:
-                line_num = title.get('line', 0)
-                title_map[line_num] = title
+            if not isinstance(parsing_res_list, list):
+                logger.warning(f"[PaddleOCR JSON解析] JSON文件 {filename} 的parsing_res_list字段不是列表类型")
+                return []
             
-            # 解析 markdown 内容，生成 chunks
+            logger.info(f"[PaddleOCR JSON解析] parsing_res_list包含 {len(parsing_res_list)} 个block")
+            
+            # 提取标题层级和段落
+            paragraphs, sections = self._extract_paragraphs_from_json_blocks(parsing_res_list, filename)
+            logger.info(f"[PaddleOCR JSON解析] 提取了 {len(paragraphs)} 个段落，{len(sections)} 个章节")
+            
+            # 创建基础文档结构（用于获取 docnm_kwd 等字段）
+            base_doc = self._create_base_doc(filename)
+            
+            # 创建 chunks
             chunks = []
-            lines = markdown_content.split('\n')
-            current_section_content = []
-            current_section_title_hierarchy = []
-            current_page = 1  # 简化处理，假设从第1页开始
             
-            for line_num, line in enumerate(lines, 1):
-                # 检查是否是标题行
-                if re.match(r"^#{1,6}\s+.*$", line):
-                    match = re.match(r'^(#{1,6})\s+(.+)$', line.strip())
-                    if match:
-                        title_text = match.group(2).strip()
-                        
-                        # 过滤无效标题
-                        if title_text.startswith('<!--') or title_text.endswith('-->'):
-                            continue
-                        if not title_text or not is_valid_title(title_text):
-                            continue
-                        
-                        # 如果当前 section 有内容，先保存为 chunk
-                        if current_section_content:
-                            chunk = self._create_chunk_from_section(
-                                filename, 
-                                current_section_title_hierarchy, 
-                                current_section_content,
-                                current_page
-                            )
-                            if chunk:
-                                chunks.append(chunk)
-                            current_section_content = []
-                        
-                        # 更新当前 section 的标题层级
-                        title_info = title_map.get(line_num)
-                        if title_info:
-                            level = title_info.get('level', 2)
-                            # 根据层级更新 current_hierarchy
-                            # level 从 2 开始（对应 markdown 的 ##），所以需要减 2
-                            hierarchy_level = max(0, level - 2)
-                            # 删除超出当前层级的标题
-                            while len(current_section_title_hierarchy) > hierarchy_level:
-                                current_section_title_hierarchy.pop()
-                            # 现在列表长度应该 <= hierarchy_level
-                            # 如果层级等于列表长度，追加新标题
-                            if hierarchy_level == len(current_section_title_hierarchy):
-                                current_section_title_hierarchy.append(title_text)
-                            elif hierarchy_level < len(current_section_title_hierarchy):
-                                # 替换对应层级的标题（这种情况理论上不应该发生，因为 while 循环已经处理了）
-                                # 但为了安全起见，还是处理一下
-                                current_section_title_hierarchy[hierarchy_level] = title_text
-                                # 删除超出层级的元素
-                                while len(current_section_title_hierarchy) > hierarchy_level + 1:
-                                    current_section_title_hierarchy.pop()
-                            else:
-                                # 如果层级大于列表长度，先扩展列表到 hierarchy_level 长度，然后追加
-                                # 这种情况可能发生在第一个标题的层级不是0时
-                                while len(current_section_title_hierarchy) < hierarchy_level:
-                                    current_section_title_hierarchy.append("")
-                                current_section_title_hierarchy.append(title_text)
-                            self.title_hierarchy = current_section_title_hierarchy.copy()
-                else:
-                    # 普通文本行，添加到当前 section
-                    if line.strip():
-                        current_section_content.append(line)
+            # 创建段落级 chunks（用于检索）
+            for para in paragraphs:
+                para_chunk = self._create_paragraph_chunk(para, filename, base_doc, **kwargs)
+                if para_chunk:
+                    chunks.append(para_chunk)
             
-            # 处理最后一个 section
-            if current_section_content:
-                chunk = self._create_chunk_from_section(
-                    filename,
-                    current_section_title_hierarchy,
-                    current_section_content,
-                    current_page
-                )
-                if chunk:
-                    chunks.append(chunk)
+            # 创建章节级 chunks（用于返回）
+            for section in sections:
+                section_chunk = self._create_section_chunk(section, filename, base_doc, **kwargs)
+                if section_chunk:
+                    chunks.append(section_chunk)
             
-            logger.info(f"[Markdown解析] Markdown文件 {filename} 解析完成，生成 {len(chunks)} 个chunks")
+            logger.info(f"[PaddleOCR JSON解析] JSON文件 {filename} 解析完成: 生成 {len(chunks)} 个chunks (段落: {len(paragraphs)}, 章节: {len(sections)})")
             return chunks
             
-        except Exception as e:
-            logger.error(f"[Markdown解析] 处理Markdown文件 {filename} 时发生错误: {str(e)}", exc_info=True)
+        except json.JSONDecodeError as e:
+            logger.error(f"[PaddleOCR JSON解析] JSON文件 {filename} 解析失败（JSON格式错误）: {str(e)}", exc_info=True)
             return []
+        except Exception as e:
+            logger.error(f"[PaddleOCR JSON解析] 处理JSON文件 {filename} 时发生错误: {str(e)}", exc_info=True)
+            return []
+    
+    def _determine_title_level_dynamic(self, title_text: str, pattern_priority: int, dot_count: Optional[int], 
+                                       pattern_to_level: Dict[Tuple[int, Optional[int]], int]) -> int:
+        """
+        动态判定标题的 level
+        
+        Args:
+            title_text: 标题文本
+            pattern_priority: 模式优先级
+            dot_count: 点号数量（仅用于数字x.x格式）
+            pattern_to_level: 模式到 level 的映射字典 {(priority, dot_count): level}
+        
+        Returns:
+            标题的 level（从1开始）
+        """
+        pattern_key = (pattern_priority, dot_count)
+        
+        # 如果该模式已经分配过 level，直接返回
+        if pattern_key in pattern_to_level:
+            return pattern_to_level[pattern_key]
+        
+        # 如果是第一个标题，分配 level 1
+        if not pattern_to_level:
+            pattern_to_level[pattern_key] = 1
+            return 1
+        
+        # 找到当前已分配的最大 level
+        max_level = max(pattern_to_level.values()) if pattern_to_level else 0
+        
+        # 新模式的 level = max_level + 1
+        new_level = max_level + 1
+        pattern_to_level[pattern_key] = new_level
+        
+        logger.debug(f"[动态Level判定] 标题 '{title_text}' 模式 ({pattern_priority}, {dot_count}) 分配 level {new_level}")
+        return new_level
+    
+    def _extract_paragraphs_from_json_blocks(self, blocks: List[Dict[str, Any]], filename: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """
+        从 JSON blocks 中提取段落和章节
+        
+        Args:
+            blocks: parsing_res_list 中的 block 列表
+            filename: 文件名
+        
+        Returns:
+            (paragraphs, sections) 元组
+            - paragraphs: 段落列表，每个段落包含 content, page_index, section_path, parent_section_id 等
+            - sections: 章节列表，每个章节包含 section_id, section_path, paragraph_chunk_ids, content 等
+        """
+        paragraphs = []
+        sections = []
+        
+        # 动态 level 映射：{(priority, dot_count): level}
+        pattern_to_level: Dict[Tuple[int, Optional[int]], int] = {}
+        
+        # 当前章节路径（用于构建 section_path）
+        current_section_path: List[str] = []
+        
+        # 当前章节信息
+        current_section: Optional[Dict[str, Any]] = None
+        current_section_paragraph_ids: List[str] = []
+        
+        # 跨页段落拼接：存储上一个页面的最后一个 text block
+        last_text_block: Optional[Dict[str, Any]] = None
+        last_page_index: Optional[int] = None
+        
+        # 段落计数器（用于生成段落 chunk ID）
+        paragraph_counter = 0
+        
+        for block in blocks:
+            block_label = block.get("block_label", "")
+            block_content = block.get("block_content", "").strip()
+            page_index = block.get("page_index", 1)
+            block_id = block.get("block_id", 0)
+            
+            # 跳过空内容
+            if not block_content:
+                continue
+            
+            # 处理标题（paragraph_title）
+            if block_label == "paragraph_title":
+                # 先处理上一个未完成的段落（如果有）
+                if last_text_block:
+                    paragraph_counter += 1
+                    para_chunk_id = f"{filename}_para_{paragraph_counter}"
+                    paragraph = {
+                        "content": last_text_block.get("block_content", "").strip(),
+                        "page_index": last_page_index or 1,
+                        "section_path": current_section_path.copy(),
+                        "parent_section_id": current_section.get("section_id") if current_section else None,
+                        "chunk_id": para_chunk_id
+                    }
+                    paragraphs.append(paragraph)
+                    if current_section:
+                        current_section_paragraph_ids.append(para_chunk_id)
+                    last_text_block = None
+                    last_page_index = None
+                
+                # 处理当前标题
+                # 获取标题的模式信息
+                priority, dot_count = get_title_pattern_info(block_content)
+                
+                if priority >= 0:  # 匹配到有效模式
+                    # 动态判定 level
+                    level = self._determine_title_level_dynamic(block_content, priority, dot_count, pattern_to_level)
+                    
+                    # 更新章节路径
+                    # 如果新标题的 level 小于等于当前路径长度，需要截断路径
+                    while len(current_section_path) >= level:
+                        current_section_path.pop()
+                    
+                    # 添加新标题到路径
+                    current_section_path.append(block_content)
+                    
+                    # 创建新章节
+                    section_id = hashlib.md5(" > ".join(current_section_path).encode('utf-8')).hexdigest()
+                    
+                    # 如果存在上一个章节，先保存它（不聚合内容，内容聚合在 _apply_paper_merge_strategy 中完成）
+                    if current_section:
+                        current_section["paragraph_chunk_ids"] = current_section_paragraph_ids.copy()
+                        sections.append(current_section)
+                    
+                    # 创建新章节
+                    current_section = {
+                        "section_id": section_id,
+                        "section_path": current_section_path.copy(),
+                        "level": level,
+                        "paragraph_chunk_ids": [],
+                        "content": ""  # 内容会在后续段落中填充
+                    }
+                    current_section_paragraph_ids = []
+                    
+                    logger.debug(f"[段落提取] 发现标题: '{block_content}' (level={level}, section_id={section_id})")
+            
+            # 处理段落（text）和摘要（abstract）
+            elif block_label == "text" or block_label == "abstract":
+                # 检查是否需要跨页拼接（只有跨页且中间没有 paragraph_title 时才合并）
+                if last_text_block and last_page_index and page_index == last_page_index + 1:
+                    # 跨页拼接：将上一个页面的最后一个 text 和当前页面的第一个 text 合并
+                    # 这是因为 PaddleOCR 错误地将一个段落识别为两个段落
+                    combined_content = last_text_block.get("block_content", "").strip() + block_content
+                    
+                    paragraph_counter += 1
+                    para_chunk_id = f"{filename}_para_{paragraph_counter}"
+                    paragraph = {
+                        "content": combined_content,
+                        "page_index": last_page_index,  # 使用第一个段落的页码
+                        "section_path": current_section_path.copy(),
+                        "parent_section_id": current_section.get("section_id") if current_section else None,
+                        "chunk_id": para_chunk_id
+                    }
+                    paragraphs.append(paragraph)
+                    if current_section:
+                        current_section_paragraph_ids.append(para_chunk_id)
+                    
+                    last_text_block = None
+                    last_page_index = None
+                else:
+                    # 如果不是跨页拼接，先处理上一个 text block（如果有）
+                    if last_text_block:
+                        paragraph_counter += 1
+                        para_chunk_id = f"{filename}_para_{paragraph_counter}"
+                        paragraph = {
+                            "content": last_text_block.get("block_content", "").strip(),
+                            "page_index": last_page_index or 1,
+                            "section_path": current_section_path.copy(),
+                            "parent_section_id": current_section.get("section_id") if current_section else None,
+                            "chunk_id": para_chunk_id
+                        }
+                        paragraphs.append(paragraph)
+                        if current_section:
+                            current_section_paragraph_ids.append(para_chunk_id)
+                    
+                    # 保存当前 text block，等待下一个 block 判断是否需要跨页拼接
+                    last_text_block = block
+                    last_page_index = page_index
+            
+            # 忽略其他类型的 block（figure_title, table 等）
+            else:
+                # 只有当遇到 paragraph_title 时，才处理上一个 text block
+                # 其他类型的 block（如 footnote、number、header 等）不应该中断跨页拼接
+                # 这样 page N 的最后一个 text 和 page N+1 的第一个 text 可以合并
+                if block_label == "paragraph_title":
+                    # 如果遇到标题，上一个 text block 应该单独成段
+                    if last_text_block:
+                        paragraph_counter += 1
+                        para_chunk_id = f"{filename}_para_{paragraph_counter}"
+                        paragraph = {
+                            "content": last_text_block.get("block_content", "").strip(),
+                            "page_index": last_page_index or 1,
+                            "section_path": current_section_path.copy(),
+                            "parent_section_id": current_section.get("section_id") if current_section else None,
+                            "chunk_id": para_chunk_id
+                        }
+                        paragraphs.append(paragraph)
+                        if current_section:
+                            current_section_paragraph_ids.append(para_chunk_id)
+                        last_text_block = None
+                        last_page_index = None
+                # 其他类型的 block（footnote、number、header 等）不影响跨页拼接，直接跳过
+        
+        # 处理最后一个未完成的段落
+        if last_text_block:
+            paragraph_counter += 1
+            para_chunk_id = f"{filename}_para_{paragraph_counter}"
+            paragraph = {
+                "content": last_text_block.get("block_content", "").strip(),
+                "page_index": last_page_index or 1,
+                "section_path": current_section_path.copy(),
+                "parent_section_id": current_section.get("section_id") if current_section else None,
+                "chunk_id": para_chunk_id
+            }
+            paragraphs.append(paragraph)
+            if current_section:
+                current_section_paragraph_ids.append(para_chunk_id)
+        
+        # 保存最后一个章节（不聚合内容，内容聚合在 _apply_paper_merge_strategy 中完成）
+        if current_section:
+            current_section["paragraph_chunk_ids"] = current_section_paragraph_ids.copy()
+            sections.append(current_section)
+        
+        return paragraphs, sections
+    
+    def _create_paragraph_chunk(self, paragraph: Dict[str, Any], filename: str, base_doc: Dict[str, Any], **kwargs) -> Optional[Dict[str, Any]]:
+        """
+        创建段落级 chunk（用于检索）
+        
+        Args:
+            paragraph: 段落信息字典
+            filename: 文件名
+            base_doc: 基础文档结构（包含 docnm_kwd 等字段）
+            **kwargs: 其他参数（可能包含 doc_id, kb_id 等）
+        
+        Returns:
+            chunk 字典，如果创建失败返回 None
+        """
+        try:
+            content = paragraph.get("content", "").strip()
+            if not content:
+                return None
+            
+            section_path = paragraph.get("section_path", [])
+            parent_section_id = paragraph.get("parent_section_id", "")
+            page_index = paragraph.get("page_index", 1)
+            chunk_id = paragraph.get("chunk_id", "")
+            
+            # 构建章节路径字符串
+            section_path_str = " > ".join(section_path) if section_path else ""
+            
+            # 构建章节标题前缀（保持与原有格式兼容：[章节标题]\n段落内容）
+            section_title_prefix = ""
+            if section_path_str:
+                section_title_prefix = "[" + section_path_str + "]\n"
+            
+            # 构建 content_with_weight（格式：[章节标题]\n段落内容，与原有格式兼容）
+            content_with_weight = section_title_prefix + content
+            
+            # 创建 chunk
+            chunk = {
+                "id": chunk_id,
+                "content_with_weight": content_with_weight,
+                "content": content,  # 原始段落内容（用于向量化）
+                "page_num_int": [page_index],  # 列表格式
+                "parent_section_id": parent_section_id or "",
+                "section_path": section_path_str,  # 章节路径字符串
+                "chunk_type": "paragraph",  # 标记为段落级 chunk
+                "docnm_kwd": base_doc.get("docnm_kwd", ""),
+                "title_tks": base_doc.get("title_tks", ""),
+                "title_sm_tks": base_doc.get("title_sm_tks", ""),
+                "doc_id": kwargs.get("doc_id", ""),
+                "kb_id": kwargs.get("kb_id", ""),
+                "position_int": [[page_index, 0, 0, 0, 0]],  # 简化位置信息
+                "top_int": [0],
+                "doc_type_kwd": "text"  # 标记为文本类型
+            }
+            
+            return chunk
+            
+        except Exception as e:
+            logger.error(f"[创建段落Chunk] 创建段落chunk失败: {str(e)}", exc_info=True)
+            return None
+    
+    def _create_section_chunk(self, section: Dict[str, Any], filename: str, base_doc: Dict[str, Any], **kwargs) -> Optional[Dict[str, Any]]:
+        """
+        创建章节级 chunk（用于返回）
+        
+        Args:
+            section: 章节信息字典
+            filename: 文件名
+            base_doc: 基础文档结构（包含 docnm_kwd 等字段）
+            **kwargs: 其他参数（可能包含 doc_id, kb_id 等）
+        
+        Returns:
+            chunk 字典，如果创建失败返回 None
+        """
+        try:
+            section_id = section.get("section_id", "")
+            section_path = section.get("section_path", [])
+            content = section.get("content", "").strip()  # 可能为空，将在 _apply_paper_merge_strategy 中填充
+            paragraph_chunk_ids = section.get("paragraph_chunk_ids", [])
+            
+            if not section_id:
+                return None
+            
+            # 构建章节路径字符串
+            section_path_str = " > ".join(section_path) if section_path else ""
+            
+            # 构建 content_with_weight（格式：[章节标题]\n章节内容，与原有格式兼容）
+            if section_path_str:
+                content_with_weight = "[" + section_path_str + "]\n" + content
+            else:
+                content_with_weight = content
+            
+            # 创建 chunk（章节级 chunk 的 ID 就是 section_id）
+            chunk = {
+                "id": section_id,
+                "content_with_weight": content_with_weight,
+                "content": content,  # 章节内容（用于向量化，但不会被检索）
+                "parent_section_id": "",  # 章节级 chunk 没有父章节
+                "section_path": section_path_str,  # 章节路径字符串
+                "paragraph_chunk_ids": paragraph_chunk_ids,  # 关联的段落 chunk IDs
+                "chunk_type": "section",  # 标记为章节级 chunk
+                "docnm_kwd": base_doc.get("docnm_kwd", ""),
+                "title_tks": base_doc.get("title_tks", ""),
+                "title_sm_tks": base_doc.get("title_sm_tks", ""),
+                "doc_id": kwargs.get("doc_id", ""),
+                "kb_id": kwargs.get("kb_id", ""),
+                "page_num_int": [],  # 章节级 chunk 可能跨多页
+                "position_int": [],
+                "top_int": [],
+                "doc_type_kwd": "text"  # 标记为文本类型
+            }
+            
+            return chunk
+            
+        except Exception as e:
+            logger.error(f"[创建章节Chunk] 创建章节chunk失败: {str(e)}", exc_info=True)
+            return None
     
     def _create_chunk_from_section(self, filename: str, title_hierarchy: List[str], content_lines: List[str], page_id: int) -> Optional[Dict[str, Any]]:
         """
@@ -1683,6 +2025,9 @@ class CustomPdfParser:
         """
         简单的合并策略 - 基于section_title分组合并
         理论上相同section_title的chunks应该合并在一起
+        
+        注意：对于段落级（chunk_type="paragraph"）和章节级（chunk_type="section"）chunks，
+        不进行合并，因为它们已经按照新的设计进行了处理。
         """
         if not chunks:
             logger.info(f"[合并策略] 没有chunks需要合并: {filename}")
@@ -1690,7 +2035,14 @@ class CustomPdfParser:
         
         logger.info(f"[合并策略] 开始应用合并策略: {filename}, 原始chunks数: {len(chunks)}")
         
-        # 按section_title分组
+        # 检查是否有段落级或章节级 chunks（新设计）
+        has_new_chunk_types = any(chunk.get('chunk_type') in ('paragraph', 'section') for chunk in chunks)
+        
+        if has_new_chunk_types:
+            # 处理新设计的 chunks（段落级和章节级）
+            return self._apply_new_chunk_merge_strategy(chunks, filename)
+        
+        # 按section_title分组（原有逻辑，用于其他类型的chunks，如 textin 的旧格式）
         grouped_chunks = {}
         title_chunks = []
         table_chunks = []  # 表格chunks单独处理，不参与合并
@@ -1745,6 +2097,111 @@ class CustomPdfParser:
         
         logger.info(f"[合并策略] 合并完成: {filename}, {len(chunks)} -> {len(merged_chunks)} chunks (合并了 {merged_count} 个分组，保留 {single_count} 个单chunk分组)")
         return merged_chunks
+    
+    def _apply_new_chunk_merge_strategy(self, chunks: List[Dict[str, Any]], filename: str) -> List[Dict[str, Any]]:
+        """
+        处理新设计的 chunks（段落级和章节级）的合并策略
+        
+        1. 对于 section 类型的 chunks：根据 paragraph_chunk_ids 聚合内容
+        2. 对于没有 section_path 的段落：聚合到一个"无标题章节"中
+        """
+        paragraph_chunks = [c for c in chunks if c.get('chunk_type') == 'paragraph']
+        section_chunks = [c for c in chunks if c.get('chunk_type') == 'section']
+        other_chunks = [c for c in chunks if c.get('chunk_type') not in ('paragraph', 'section')]
+        
+        # 创建段落 ID 到段落 chunk 的映射
+        paragraph_map = {chunk.get('id', ''): chunk for chunk in paragraph_chunks}
+        
+        # 处理 section chunks：聚合内容
+        processed_section_chunks = []
+        for section_chunk in section_chunks:
+            section_chunk = copy.deepcopy(section_chunk)
+            paragraph_chunk_ids = section_chunk.get('paragraph_chunk_ids', [])
+            
+            # 如果 paragraph_chunk_ids 是字符串，尝试解析为 JSON
+            if isinstance(paragraph_chunk_ids, str):
+                try:
+                    import json
+                    paragraph_chunk_ids = json.loads(paragraph_chunk_ids)
+                except:
+                    paragraph_chunk_ids = []
+            
+            # 聚合段落内容
+            section_content_parts = []
+            for para_chunk_id in paragraph_chunk_ids:
+                para_chunk = paragraph_map.get(para_chunk_id)
+                if para_chunk:
+                    # 从段落 chunk 的 content_with_weight 中提取内容
+                    content_with_weight = para_chunk.get('content_with_weight', '')
+                    if content_with_weight.startswith('[') and ']\n' in content_with_weight:
+                        # 去掉章节标题前缀，只保留段落内容
+                        content = content_with_weight.split(']\n', 1)[1]
+                    else:
+                        content = content_with_weight
+                    section_content_parts.append(content)
+            
+            # 更新 section chunk 的内容
+            section_content = "\n\n".join(section_content_parts)
+            section_path_str = section_chunk.get('section_path', '')
+            
+            if section_path_str:
+                section_chunk['content_with_weight'] = f"[{section_path_str}]\n{section_content}"
+            else:
+                section_chunk['content_with_weight'] = section_content
+            
+            section_chunk['content'] = section_content
+            processed_section_chunks.append(section_chunk)
+        
+        # 处理没有 section_path 的段落：聚合到一个"无标题章节"中
+        no_title_paragraphs = [c for c in paragraph_chunks if not c.get('section_path', '').strip()]
+        
+        if no_title_paragraphs:
+            # 创建无标题章节
+            import hashlib
+            no_title_section_id = hashlib.md5("__no_title__".encode('utf-8')).hexdigest()
+            no_title_paragraph_ids = [c.get('id', '') for c in no_title_paragraphs]
+            
+            # 聚合内容
+            no_title_content_parts = []
+            for para_chunk in no_title_paragraphs:
+                content_with_weight = para_chunk.get('content_with_weight', '')
+                if content_with_weight.startswith('[') and ']\n' in content_with_weight:
+                    content = content_with_weight.split(']\n', 1)[1]
+                else:
+                    content = content_with_weight
+                no_title_content_parts.append(content)
+            
+            no_title_content = "\n\n".join(no_title_content_parts)
+            
+            # 创建无标题章节 chunk
+            no_title_section_chunk = {
+                "id": no_title_section_id,
+                "content_with_weight": no_title_content,
+                "content": no_title_content,
+                "parent_section_id": "",
+                "section_path": "",
+                "paragraph_chunk_ids": no_title_paragraph_ids,
+                "chunk_type": "section",
+                "docnm_kwd": no_title_paragraphs[0].get('docnm_kwd', '') if no_title_paragraphs else '',
+                "title_tks": no_title_paragraphs[0].get('title_tks', '') if no_title_paragraphs else '',
+                "title_sm_tks": no_title_paragraphs[0].get('title_sm_tks', '') if no_title_paragraphs else '',
+                "doc_id": no_title_paragraphs[0].get('doc_id', '') if no_title_paragraphs else '',
+                "kb_id": no_title_paragraphs[0].get('kb_id', '') if no_title_paragraphs else '',
+                "page_num_int": [],
+                "position_int": [],
+                "top_int": [],
+                "doc_type_kwd": "text"
+            }
+            processed_section_chunks.append(no_title_section_chunk)
+        
+        # 返回：所有段落 chunks + 处理后的章节 chunks + 其他 chunks
+        # 注意：段落级 chunks 全部保留（用于检索），无 section_path 的段落也会被聚合到无标题章节中（用于返回）
+        result_chunks = paragraph_chunks + processed_section_chunks + other_chunks
+        
+        logger.info(f"[合并策略] 新设计chunks处理完成: {filename}, {len(chunks)} -> {len(result_chunks)} chunks "
+                   f"(段落: {len(paragraph_chunks)}, 章节: {len(processed_section_chunks)}, 其他: {len(other_chunks)})")
+        
+        return result_chunks
     
     def _create_merged_chunk(self, text_chunks: List[Dict[str, Any]], section_title: str) -> Optional[Dict[str, Any]]:
         """
@@ -1970,10 +2427,7 @@ def chunk(filename: str, binary: Optional[bytes] = None, from_page: int = 0, to_
             logger.info(f"解析统计 - 标题: {len(title_chunks)}, 文本: {len(text_chunks)}, 表格: {len(table_chunks)}, 图像: {len(image_chunks)}")
             print(f"解析统计 - 标题: {len(title_chunks)}, 文本: {len(text_chunks)}, 表格: {len(table_chunks)}, 图像: {len(image_chunks)}")
         
-        # 删除section_title字段，避免Infinity数据库插入错误
-        for chunk in processed_chunks:
-            if "section_title" in chunk:
-                del chunk["section_title"]
+        # section_title 字段已统一使用 section_path，无需删除
         
         # 过滤掉标题类型的chunks，只返回文本内容
         filtered_chunks = [c for c in processed_chunks if c.get("doc_type_kwd") != "title"]
