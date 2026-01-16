@@ -545,6 +545,32 @@ class CustomPdfParser:
         self.enable_smart_chunking = self.custom_config.get("enable_smart_chunking", True)
         self.custom_delimiter = self.custom_config.get("delimiter", "\n!?;。；！？")
         
+        # 短段落合并配置（复用parser_config中的chunk_token_num）
+        parser_config = kwargs.get("parser_config", {})
+        self.chunk_token_num = parser_config.get("chunk_token_num", 512)
+        self.delimiter = parser_config.get("delimiter", r"\n")
+        
+        # 短段落合并配置参数（医疗指南场景最佳默认值）
+        self.enable_short_paragraph_merge = self.custom_config.get("enable_short_paragraph_merge", True)
+        short_paragraph_threshold_ratio = self.custom_config.get("short_paragraph_threshold_ratio", 0.25)  # 医疗指南场景：0.25
+        self.short_paragraph_threshold = int(self.chunk_token_num * short_paragraph_threshold_ratio)
+        
+        max_merged_paragraph_length_ratio = self.custom_config.get("max_merged_paragraph_length_ratio", 1.0)
+        self.max_merged_paragraph_length = int(self.chunk_token_num * max_merged_paragraph_length_ratio)
+        
+        # 短段落识别模式（如果未提供，使用内置模式）
+        self.short_paragraph_patterns = self.custom_config.get("short_paragraph_patterns", None)
+        if self.short_paragraph_patterns is None:
+            # 内置默认模式
+            self.short_paragraph_patterns = [
+                r"^\([0-9]+\)",           # (1), (2), (10)
+                r"^[0-9]+[\.、]",         # 1., 2., 1、, 2、
+                r"^[（(][零一二三四五六七八九十百千0-9]+[）)]",  # （一）, (一)
+                r"^[零一二三四五六七八九十百千]+[、．]",  # 一、, 二．
+                r"^[①②③④⑤⑥⑦⑧⑨⑩]",  # 圆圈数字
+                r"^[a-zA-Z][\.、\)]",     # a., b), A、, B)
+            ]
+        
         # 章节标题层级管理
         self.title_hierarchy: List[str] = []
         self.current_hierarchy: List[str] = []
@@ -1460,6 +1486,34 @@ class CustomPdfParser:
         logger.debug(f"[动态Level判定] 标题 '{title_text}' 模式 ({pattern_priority}, {dot_count}) 分配 level {new_level}")
         return new_level
     
+    def _is_short_paragraph(self, block_content: str) -> bool:
+        """
+        判断是否为短段落
+        
+        Args:
+            block_content: block的内容
+        
+        Returns:
+            True表示是短段落，False表示不是
+        """
+        if not self.enable_short_paragraph_merge:
+            return False
+        
+        content = block_content.strip()
+        if not content:
+            return False
+        
+        # 检查字符数：如果字符数小于阈值，认为是短段落
+        if len(content) < self.short_paragraph_threshold:
+            return True
+        
+        # 如果字符数超过阈值，但匹配编号列表模式，也认为是短段落（用于处理较长的编号列表项）
+        for pattern in self.short_paragraph_patterns:
+            if re.match(pattern, content):
+                return True
+        
+        return False
+    
     def _extract_paragraphs_from_json_blocks(self, blocks: List[Dict[str, Any]], filename: str, doc_id: str = "") -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         """
         从 JSON blocks 中提取段落和章节
@@ -1573,6 +1627,10 @@ class CustomPdfParser:
         # 跨页段落拼接：存储上一个页面的最后一个 text block
         last_text_block: Optional[Dict[str, Any]] = None
         last_page_index: Optional[int] = None
+        
+        # 短段落合并：暂存待合并的短段落
+        pending_short_paragraphs: List[Dict[str, Any]] = []  # 存储待合并的短段落block
+        pending_short_paragraphs_page_index: Optional[int] = None
         
         # 段落计数器（用于生成段落 chunk ID）
         paragraph_counter = 0
@@ -1778,29 +1836,108 @@ class CustomPdfParser:
                 if not block_content:
                     continue
                 
+                # 判断是否为短段落
+                is_short = self._is_short_paragraph(block_content)
+                
                 # 检查是否需要跨页拼接（只有跨页且中间没有 paragraph_title 时才合并）
                 if last_text_block and last_page_index and page_index == last_page_index + 1:
                     # 跨页拼接：将上一个页面的最后一个 text 和当前页面的第一个 text 合并
                     # 这是因为 PaddleOCR 错误地将一个段落识别为两个段落
                     combined_content = last_text_block.get("block_content", "").strip() + block_content
                     
-                    paragraph_counter += 1
-                    para_chunk_id = f"{filename}_para_{paragraph_counter}"
-                    paragraph = {
-                        "content": combined_content,
-                        "page_index": last_page_index,  # 使用第一个段落的页码
-                        "section_path": current_section_path.copy(),
-                        "parent_section_id": get_parent_section_id(para_chunk_id),
-                        "chunk_id": para_chunk_id
-                    }
-                    paragraphs.append(paragraph)
-                    if current_section:
-                        current_section_paragraph_ids.append(para_chunk_id)
+                    # 如果合并后的内容仍然是短段落，且当前block也是短段落，加入待合并列表
+                    if self.enable_short_paragraph_merge and is_short and self._is_short_paragraph(combined_content):
+                        # 清空last_text_block，将合并后的内容加入待合并列表
+                        if pending_short_paragraphs_page_index is None:
+                            pending_short_paragraphs_page_index = last_page_index
+                        pending_short_paragraphs.append({
+                            "block_content": combined_content,
+                            "page_index": last_page_index
+                        })
+                        last_text_block = None
+                        last_page_index = None
+                    else:
+                        # 合并后不是短段落，或者短段落合并未启用，直接创建段落
+                        paragraph_counter += 1
+                        para_chunk_id = f"{filename}_para_{paragraph_counter}"
+                        paragraph = {
+                            "content": combined_content,
+                            "page_index": last_page_index,  # 使用第一个段落的页码
+                            "section_path": current_section_path.copy(),
+                            "parent_section_id": get_parent_section_id(para_chunk_id),
+                            "chunk_id": para_chunk_id
+                        }
+                        paragraphs.append(paragraph)
+                        if current_section:
+                            current_section_paragraph_ids.append(para_chunk_id)
+                        
+                        last_text_block = None
+                        last_page_index = None
+                elif is_short and self.enable_short_paragraph_merge:
+                    # 当前block是短段落，先处理上一个非短段落（如果有）
+                    if last_text_block:
+                        paragraph_counter += 1
+                        para_chunk_id = f"{filename}_para_{paragraph_counter}"
+                        paragraph = {
+                            "content": last_text_block.get("block_content", "").strip(),
+                            "page_index": last_page_index or 1,
+                            "section_path": current_section_path.copy(),
+                            "parent_section_id": get_parent_section_id(para_chunk_id),
+                            "chunk_id": para_chunk_id
+                        }
+                        paragraphs.append(paragraph)
+                        if current_section:
+                            current_section_paragraph_ids.append(para_chunk_id)
+                        last_text_block = None
+                        last_page_index = None
                     
-                    last_text_block = None
-                    last_page_index = None
+                    # 将当前短段落加入待合并列表
+                    if pending_short_paragraphs_page_index is None:
+                        pending_short_paragraphs_page_index = page_index
+                    pending_short_paragraphs.append({
+                        "block_content": block_content,
+                        "page_index": page_index
+                    })
                 else:
-                    # 如果不是跨页拼接，先处理上一个 text block（如果有）
+                    # 当前block不是短段落，先处理待合并的短段落（如果有）
+                    if pending_short_paragraphs:
+                        merged_content_parts = [p["block_content"] for p in pending_short_paragraphs]
+                        merged_content = "\n".join(merged_content_parts)
+                        
+                        # 检查合并后的长度是否超过限制
+                        if len(merged_content) <= self.max_merged_paragraph_length:
+                            paragraph_counter += 1
+                            para_chunk_id = f"{filename}_para_{paragraph_counter}"
+                            paragraph = {
+                                "content": merged_content,
+                                "page_index": pending_short_paragraphs_page_index or 1,
+                                "section_path": current_section_path.copy(),
+                                "parent_section_id": get_parent_section_id(para_chunk_id),
+                                "chunk_id": para_chunk_id
+                            }
+                            paragraphs.append(paragraph)
+                            if current_section:
+                                current_section_paragraph_ids.append(para_chunk_id)
+                        else:
+                            # 超过长度限制，分别创建段落
+                            for p in pending_short_paragraphs:
+                                paragraph_counter += 1
+                                para_chunk_id = f"{filename}_para_{paragraph_counter}"
+                                paragraph = {
+                                    "content": p["block_content"],
+                                    "page_index": p["page_index"],
+                                    "section_path": current_section_path.copy(),
+                                    "parent_section_id": get_parent_section_id(para_chunk_id),
+                                    "chunk_id": para_chunk_id
+                                }
+                                paragraphs.append(paragraph)
+                                if current_section:
+                                    current_section_paragraph_ids.append(para_chunk_id)
+                        
+                        pending_short_paragraphs = []
+                        pending_short_paragraphs_page_index = None
+                    
+                    # 处理上一个非短段落（如果有）
                     if last_text_block:
                         paragraph_counter += 1
                         para_chunk_id = f"{filename}_para_{paragraph_counter}"
@@ -1825,6 +1962,44 @@ class CustomPdfParser:
                 # 其他类型的 block（如 footnote、number、header 等）不应该中断跨页拼接
                 # 这样 page N 的最后一个 text 和 page N+1 的第一个 text 可以合并
                 if block_label == "paragraph_title":
+                    # 如果遇到标题，先处理待合并的短段落（如果有）
+                    if pending_short_paragraphs:
+                        merged_content_parts = [p["block_content"] for p in pending_short_paragraphs]
+                        merged_content = "\n".join(merged_content_parts)
+                        
+                        # 检查合并后的长度是否超过限制
+                        if len(merged_content) <= self.max_merged_paragraph_length:
+                            paragraph_counter += 1
+                            para_chunk_id = f"{filename}_para_{paragraph_counter}"
+                            paragraph = {
+                                "content": merged_content,
+                                "page_index": pending_short_paragraphs_page_index or 1,
+                                "section_path": current_section_path.copy(),
+                                "parent_section_id": get_parent_section_id(para_chunk_id),
+                                "chunk_id": para_chunk_id
+                            }
+                            paragraphs.append(paragraph)
+                            if current_section:
+                                current_section_paragraph_ids.append(para_chunk_id)
+                        else:
+                            # 超过长度限制，分别创建段落
+                            for p in pending_short_paragraphs:
+                                paragraph_counter += 1
+                                para_chunk_id = f"{filename}_para_{paragraph_counter}"
+                                paragraph = {
+                                    "content": p["block_content"],
+                                    "page_index": p["page_index"],
+                                    "section_path": current_section_path.copy(),
+                                    "parent_section_id": get_parent_section_id(para_chunk_id),
+                                    "chunk_id": para_chunk_id
+                                }
+                                paragraphs.append(paragraph)
+                                if current_section:
+                                    current_section_paragraph_ids.append(para_chunk_id)
+                        
+                        pending_short_paragraphs = []
+                        pending_short_paragraphs_page_index = None
+                    
                     # 如果遇到标题，上一个 text block 应该单独成段
                     if last_text_block:
                         paragraph_counter += 1
@@ -1844,6 +2019,42 @@ class CustomPdfParser:
                 # 其他类型的 block（footnote、number、header 等）不影响跨页拼接，直接跳过
         
         # 处理最后一个未完成的段落
+        # 先处理待合并的短段落（如果有）
+        if pending_short_paragraphs:
+            merged_content_parts = [p["block_content"] for p in pending_short_paragraphs]
+            merged_content = "\n".join(merged_content_parts)
+            
+            # 检查合并后的长度是否超过限制
+            if len(merged_content) <= self.max_merged_paragraph_length:
+                paragraph_counter += 1
+                para_chunk_id = f"{filename}_para_{paragraph_counter}"
+                paragraph = {
+                    "content": merged_content,
+                    "page_index": pending_short_paragraphs_page_index or 1,
+                    "section_path": current_section_path.copy(),
+                    "parent_section_id": get_parent_section_id(para_chunk_id),
+                    "chunk_id": para_chunk_id
+                }
+                paragraphs.append(paragraph)
+                if current_section:
+                    current_section_paragraph_ids.append(para_chunk_id)
+            else:
+                # 超过长度限制，分别创建段落
+                for p in pending_short_paragraphs:
+                    paragraph_counter += 1
+                    para_chunk_id = f"{filename}_para_{paragraph_counter}"
+                    paragraph = {
+                        "content": p["block_content"],
+                        "page_index": p["page_index"],
+                        "section_path": current_section_path.copy(),
+                        "parent_section_id": get_parent_section_id(para_chunk_id),
+                        "chunk_id": para_chunk_id
+                    }
+                    paragraphs.append(paragraph)
+                    if current_section:
+                        current_section_paragraph_ids.append(para_chunk_id)
+        
+        # 处理最后一个非短段落（如果有）
         if last_text_block:
             paragraph_counter += 1
             para_chunk_id = f"{filename}_para_{paragraph_counter}"
@@ -2707,8 +2918,8 @@ def chunk(filename: str, binary: Optional[bytes] = None, from_page: int = 0, to_
         
         logger.info(f"[解析器初始化] Parser config: {parser_config}")
         
-        # 创建自定义解析器实例
-        parser = CustomPdfParser(custom_config=custom_config)
+        # 创建自定义解析器实例（传递parser_config用于短段落合并配置）
+        parser = CustomPdfParser(custom_config=custom_config, parser_config=parser_config)
         
         # 执行解析
         chunks = parser.parse(filename, binary, from_page, to_page, **kwargs)
