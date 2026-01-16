@@ -23,7 +23,7 @@ import hashlib
 import requests
 import base64
 import tempfile
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Tuple, Set
 from collections import Counter
 from pathlib import Path
 from io import BytesIO
@@ -1478,6 +1478,8 @@ class CustomPdfParser:
         
         # 第一遍：收集所有标题，用于统一分配层级（与 gen_title_report.py 保持一致）
         title_blocks = []
+        # 建立 block 到 title_blocks 索引的映射（用于后续快速查找）
+        block_to_title_idx: Dict[tuple, int] = {}  # (page_index, block_order, block_id, block_content) -> title_blocks index
         for idx, block in enumerate(blocks):
             block_label = block.get("block_label", "")
             # 保留标题内容中的前导空格（用于匹配模式0），只去掉尾随空格（与 gen_title_report.py 保持一致）
@@ -1500,6 +1502,7 @@ class CustomPdfParser:
                     else:
                         line_num = page_index * 10000 + 1
                     
+                    title_idx = len(title_blocks)
                     title_blocks.append({
                         'content': block_content,
                         'level': 2,  # 临时值，会被 adjust_title_levels 覆盖
@@ -1507,9 +1510,17 @@ class CustomPdfParser:
                         'file': filename,
                         'block': block  # 保存原始 block 引用
                     })
+                    # 建立映射：通过 (page_index, block_order, block_id, block_content) 来查找
+                    block_key = (page_index, block_order, block_id, block_content)
+                    block_to_title_idx[block_key] = title_idx
         
         # 使用 adjust_title_levels 统一分配层级（与 gen_title_report.py 保持一致）
         pattern_to_level: Dict[Tuple[int, Optional[int]], int] = {}
+        # 创建保留的标题集合（用于过滤，与 gen_title_report.py 保持一致）
+        # 只处理在 adjust_title_levels 返回的 adjusted_titles 中的标题
+        # 使用索引集合来跟踪哪些 title_blocks 被保留了（更可靠）
+        kept_title_indices: Set[int] = set()
+        kept_titles_set: Set[str] = set()
         
         if title_blocks:
             adjusted_titles, has_conflict = adjust_title_levels(title_blocks)
@@ -1517,7 +1528,32 @@ class CustomPdfParser:
             # 注意：adjust_title_levels 返回的 level 从 2 开始（对应 markdown 的 ##），
             # 我们直接使用这个 level，在路径构建时 level 2 对应路径深度 0，level 3 对应路径深度 1，以此类推
             for title_info in adjusted_titles:
-                priority, dot_count = get_title_pattern_info(title_info['content'])
+                title_content = title_info['content']
+                # 找到该标题在 title_blocks 中的索引（通过比较 content 和 line）
+                # 注意：由于 adjust_title_levels 可能改变了 title 对象的引用，我们需要通过内容匹配
+                for idx, orig_title in enumerate(title_blocks):
+                    # 通过比较 content 和 line 来匹配（line 是唯一的）
+                    if (orig_title['content'] == title_content and 
+                        orig_title['line'] == title_info.get('line', 0)):
+                        kept_title_indices.add(idx)
+                        break
+                
+                # 添加到保留的标题集合（用于后续过滤）
+                # 添加所有可能的变体，确保能匹配到（考虑前导空格、尾随空格、尾随冒号等）
+                # 注意：title_content 来自 title_blocks，已经是 block_content.rstrip() 的结果
+                kept_titles_set.add(title_content)
+                kept_titles_set.add(title_content.strip())  # 去掉前后空格
+                kept_titles_set.add(title_content.rstrip())  # 只去掉尾随空格（虽然理论上已经是 rstrip() 的结果）
+                kept_titles_set.add(title_content.lstrip())  # 只去掉前导空格
+                # 同时添加去掉尾随冒号的版本（因为可能有"要点提示："和"要点提示"两种形式）
+                if title_content.endswith('：') or title_content.endswith(':'):
+                    title_no_colon = title_content.rstrip('：:')
+                    kept_titles_set.add(title_no_colon)
+                    kept_titles_set.add(title_no_colon.strip())
+                    kept_titles_set.add(title_no_colon.rstrip())
+                    kept_titles_set.add(title_no_colon.lstrip())
+                
+                priority, dot_count = get_title_pattern_info(title_content)
                 pattern_key = (priority, dot_count)
                 # adjust_title_levels 返回的 level 从 2 开始（Level 2=##, Level 3=###, Level 4=####）
                 # 在路径构建时，level 2 对应路径深度 0（顶级），level 3 对应路径深度 1，以此类推
@@ -1559,6 +1595,38 @@ class CustomPdfParser:
                 # 但这里需要先检查，确保只处理有效的标题
                 if not is_valid_title(block_content):
                     continue
+                
+                # 检查该标题是否在 adjust_title_levels 返回的保留标题集合中
+                # 如果不在，说明该标题在 adjust_title_levels 中被过滤掉了，应该跳过
+                # 与 gen_title_report.py 保持一致：只处理经过 adjust_title_levels 过滤后的标题
+                # 方法1：通过 block_key 查找 title_blocks 索引
+                # 注意：使用与构建 block_key 时相同的变量，确保一致性
+                block_order = block.get("block_order")
+                block_key = (page_index, block_order, block_id, block_content)
+                title_idx = block_to_title_idx.get(block_key)
+                if title_idx is not None and title_idx not in kept_title_indices:
+                    continue
+                
+                # 方法2：如果方法1找不到，使用内容匹配（备用方案）
+                if title_idx is None:
+                    block_content_variants = [
+                        block_content,
+                        block_content.strip(),
+                        block_content.rstrip(),
+                        block_content.lstrip(),
+                    ]
+                    # 如果 block_content 以冒号结尾，也检查去掉冒号的版本
+                    if block_content.endswith('：') or block_content.endswith(':'):
+                        block_content_variants.extend([
+                            block_content.rstrip('：:'),
+                            block_content.rstrip('：:').strip(),
+                            block_content.rstrip('：:').rstrip(),
+                            block_content.rstrip('：:').lstrip(),
+                        ])
+                    
+                    # 如果所有变体都不在 kept_titles_set 中，说明该标题被过滤掉了
+                    if not any(variant in kept_titles_set for variant in block_content_variants):
+                        continue
                 
                 # 先处理上一个未完成的段落（如果有）
                 if last_text_block:
@@ -2592,14 +2660,10 @@ def chunk(filename: str, binary: Optional[bytes] = None, from_page: int = 0, to_
         filtered_chunks = [c for c in processed_chunks if c.get("doc_type_kwd") != "title"]
         
         # 移除不在 schema 中的字段（用于内部逻辑，不需要插入数据库）
-        # level: 标题层级，只在章节级 chunk 中，不需要存储
-        # line: 标题行号，只在章节级 chunk 中，不需要存储
+        # level: 保留用于 test_custom_chunk.py 等工具脚本，在 infinity_conn.py 的 insert 方法中移除
+        # line: 保留用于 test_custom_chunk.py 等工具脚本，在 infinity_conn.py 的 insert 方法中移除
         # chunk_type: 保留用于 task_executor.py 区分段落级和章节级，在 infinity_conn.py 的 insert 方法中移除
-        fields_to_remove = ["level", "line"]
-        for chunk in filtered_chunks:
-            for field in fields_to_remove:
-                if field in chunk:
-                    del chunk[field]
+        # 不再在这里移除 level 和 line，改为在 infinity_conn.py 中统一处理
         
         return filtered_chunks
         

@@ -545,6 +545,12 @@ class InfinityConnection(DocStoreConnection):
             # chunk_type: 用于 task_executor.py 区分段落级和章节级，插入前移除
             if "chunk_type" in d:
                 del d["chunk_type"]
+            # level: 标题层级，用于内部逻辑和工具脚本，插入前移除
+            if "level" in d:
+                del d["level"]
+            # line: 标题行号，用于内部逻辑和工具脚本，插入前移除
+            if "line" in d:
+                del d["line"]
             for k, v in d.items():
                 if field_keyword(k):
                     if isinstance(v, list):
@@ -645,6 +651,12 @@ class InfinityConnection(DocStoreConnection):
             # chunk_type: 用于 task_executor.py 区分段落级和章节级，插入前移除
             if "chunk_type" in d:
                 del d["chunk_type"]
+            # level: 标题层级，用于内部逻辑和工具脚本，插入前移除
+            if "level" in d:
+                del d["level"]
+            # line: 标题行号，用于内部逻辑和工具脚本，插入前移除
+            if "line" in d:
+                del d["line"]
             # content: 用于内部逻辑（在 _apply_new_chunk_merge_strategy 中使用），不需要插入数据库
             if "content" in d:
                 del d["content"]
