@@ -377,7 +377,8 @@ class InfinityConnection(DocStoreConnection):
                     break
             if not table_found:
                 logger.error(f"No valid tables found for indexNames {indexNames} and knowledgebaseIds {knowledgebaseIds}")
-                return pd.DataFrame(), 0
+                # 返回一个包含selectFields列的DataFrame，而不是空DataFrame，避免后续访问列时报错
+                return concat_dataframes([], output), 0
 
         for matchExpr in matchExprs:
             if isinstance(matchExpr, MatchTextExpr):
@@ -697,7 +698,8 @@ class InfinityConnection(DocStoreConnection):
         table_instance.delete(str_filter)
         table_instance.insert(docs)
         self.connPool.release_conn(inf_conn)
-        logger.debug(f"INFINITY inserted into section table {table_name} {str_ids}.")
+        
+        logger.info(f"INFINITY inserted {len(docs)} sections into section table {table_name}")
         return []
     
     def get_sections_by_ids(self, section_ids: list[str], indexName: str, knowledgebaseId: str = None) -> dict[str, dict]:
@@ -736,7 +738,7 @@ class InfinityConnection(DocStoreConnection):
         str_filter = f"id IN ({str_ids})"
         
         # 查询数据
-        result_df = table_instance.output(["*"]).filter(str_filter).to_df()
+        result_df, _ = table_instance.output(["*"]).filter(str_filter).to_df()
         self.connPool.release_conn(inf_conn)
         
         # 转换为字典
@@ -758,8 +760,6 @@ class InfinityConnection(DocStoreConnection):
                         elif not para_ids_str:
                             section_dict["paragraph_chunk_ids"] = []
                     sections[section_id] = section_dict
-        
-        logger.debug(f"INFINITY retrieved {len(sections)} sections from {table_name}")
         return sections
 
     def update(self, condition: dict, newValue: dict, indexName: str, knowledgebaseId: str) -> bool:

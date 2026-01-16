@@ -86,7 +86,7 @@ class Dealer:
                       ["docnm_kwd", "content_ltks", "kb_id", "img_id", "title_tks", "important_kwd", "position_int",
                        "doc_id", "page_num_int", "top_int", "create_timestamp_flt", "knowledge_graph_kwd",
                        "question_kwd", "question_tks", "doc_type_kwd",
-                       "available_int", "content_with_weight", PAGERANK_FLD, TAG_FLD])
+                       "available_int", "content_with_weight", "parent_section_id", "section_path", PAGERANK_FLD, TAG_FLD])
         kwds = set([])
 
         qst = req.get("question", "")
@@ -379,6 +379,7 @@ class Dealer:
             sim, tsim, vsim = self.rerank(
                 sres, question, 1 - vector_similarity_weight, vector_similarity_weight,
                 rank_feature=rank_feature)
+        
         # Already paginated in search function
         idx = np.argsort(sim * -1)[(page - 1) * page_size:page * page_size]
         dim = len(sres.query_vector)
@@ -387,6 +388,7 @@ class Dealer:
         sim_np = np.array(sim)
         filtered_count = (sim_np >= similarity_threshold).sum()
         ranks["total"] = int(filtered_count) # Convert from np.int64 to Python int otherwise JSON serializable error
+        
         for i in idx:
             if sim[i] < similarity_threshold:
                 break
@@ -405,6 +407,9 @@ class Dealer:
                 break
 
             position_int = chunk.get("position_int", [])
+            parent_section_id = chunk.get("parent_section_id", "")
+            section_path = chunk.get("section_path", "")
+            
             d = {
                 "chunk_id": id,
                 "content_ltks": chunk["content_ltks"],
@@ -420,8 +425,8 @@ class Dealer:
                 "vector": chunk.get(vector_column, zero_vector),
                 "positions": position_int,
                 "doc_type_kwd": chunk.get("doc_type_kwd", ""),
-                "parent_section_id": chunk.get("parent_section_id", ""),  # 用于章节聚合
-                "section_path": chunk.get("section_path", "")  # 章节路径
+                "parent_section_id": parent_section_id,  # 用于章节聚合
+                "section_path": section_path  # 章节路径
             }
             if highlight and sres.highlight:
                 if id in sres.highlight:
@@ -446,13 +451,18 @@ class Dealer:
             parent_section_ids = set()
             paragraph_chunk_map = {}  # {parent_section_id: [chunk_dict, ...]}
             
+            paragraph_count = 0
+            section_count = 0
             for chunk in ranks["chunks"]:
                 parent_section_id = chunk.get("parent_section_id", "")
                 if parent_section_id:
+                    paragraph_count += 1
                     parent_section_ids.add(parent_section_id)
                     if parent_section_id not in paragraph_chunk_map:
                         paragraph_chunk_map[parent_section_id] = []
                     paragraph_chunk_map[parent_section_id].append(chunk)
+                else:
+                    section_count += 1
             
             # 如果有需要查找的章节，批量获取章节级 chunks
             if parent_section_ids:
@@ -481,45 +491,60 @@ class Dealer:
                             search_module.index_name(tenant_id),
                             kb_id
                         )
-                        
-                        # 替换段落级 chunks 为章节级 chunks（去重）
-                        aggregated_chunks = []
-                        seen_section_ids = set()
-                        
-                        for chunk in ranks["chunks"]:
-                            parent_section_id = chunk.get("parent_section_id", "")
-                            if parent_section_id and parent_section_id in section_chunks:
-                                # 如果该章节还没有被添加过，添加章节级 chunk
-                                if parent_section_id not in seen_section_ids:
-                                    section_chunk = section_chunks[parent_section_id]
-                                    # 构建返回格式
-                                    section_chunk_dict = {
-                                        "chunk_id": section_chunk.get("id", ""),
-                                        "content_ltks": section_chunk.get("content_ltks", ""),
-                                        "content_with_weight": section_chunk.get("content_with_weight", ""),
-                                        "doc_id": section_chunk.get("doc_id", ""),
-                                        "docnm_kwd": section_chunk.get("docnm_kwd", ""),
-                                        "kb_id": section_chunk.get("kb_id", ""),
-                                        "important_kwd": section_chunk.get("important_kwd", []),
-                                        "image_id": section_chunk.get("img_id", ""),
-                                        "similarity": chunk.get("similarity", 0.0),  # 使用段落 chunk 的相似度
-                                        "vector_similarity": chunk.get("vector_similarity", 0.0),
-                                        "term_similarity": chunk.get("term_similarity", 0.0),
-                                        "vector": chunk.get("vector", []),  # 章节 chunk 没有向量，使用段落 chunk 的向量
-                                        "positions": chunk.get("positions", []),
-                                        "doc_type_kwd": section_chunk.get("doc_type_kwd", ""),
-                                        "section_path": section_chunk.get("section_path", "")
-                                    }
-                                    if highlight and "highlight" in chunk:
-                                        section_chunk_dict["highlight"] = chunk.get("highlight", "")
-                                    aggregated_chunks.append(section_chunk_dict)
-                                    seen_section_ids.add(parent_section_id)
-                            else:
-                                # 没有 parent_section_id 的 chunk，直接添加（可能是其他类型的 chunk）
-                                aggregated_chunks.append(chunk)
-                        
-                        # 更新 ranks["chunks"]
-                        ranks["chunks"] = aggregated_chunks[:page_size]
+                        if len(section_chunks) > 0:
+                            # 替换段落级 chunks 为章节级 chunks（去重）
+                            # 使用 parent_section_id 来去重（相同的逻辑 section_path 对应唯一的 section_id）
+                            aggregated_chunks = []
+                            seen_section_ids = set()  # 使用 parent_section_id 来去重
+                            section_similarity_map = {}  # {parent_section_id: max_similarity_chunk}
+                            
+                            # 第一遍：找到每个 parent_section_id 的最高相似度段落 chunk
+                            for chunk in ranks["chunks"]:
+                                parent_section_id = chunk.get("parent_section_id", "")
+                                if parent_section_id and parent_section_id in section_chunks:
+                                    similarity = chunk.get("similarity", 0.0)
+                                    if parent_section_id not in section_similarity_map:
+                                        section_similarity_map[parent_section_id] = chunk
+                                    else:
+                                        if similarity > section_similarity_map[parent_section_id].get("similarity", 0.0):
+                                            section_similarity_map[parent_section_id] = chunk
+                            
+                            # 第二遍：构建返回结果（每个 parent_section_id 只添加一次）
+                            for chunk in ranks["chunks"]:
+                                parent_section_id = chunk.get("parent_section_id", "")
+                                if parent_section_id and parent_section_id in section_chunks:
+                                    if parent_section_id not in seen_section_ids:
+                                        section_chunk = section_chunks[parent_section_id]
+                                        best_paragraph_chunk = section_similarity_map.get(parent_section_id, chunk)
+                                        
+                                        section_path_from_chunk = section_chunk.get("section_path", "")
+                                        section_chunk_dict = {
+                                            "chunk_id": section_chunk.get("id", ""),
+                                            "content_ltks": section_chunk.get("content_ltks", ""),
+                                            "content_with_weight": section_chunk.get("content_with_weight", ""),
+                                            "doc_id": section_chunk.get("doc_id", ""),
+                                            "docnm_kwd": section_chunk.get("docnm_kwd", ""),
+                                            "kb_id": section_chunk.get("kb_id", ""),
+                                            "important_kwd": section_chunk.get("important_kwd", []),
+                                            "image_id": section_chunk.get("img_id", ""),
+                                            "similarity": best_paragraph_chunk.get("similarity", 0.0),
+                                            "vector_similarity": best_paragraph_chunk.get("vector_similarity", 0.0),
+                                            "term_similarity": best_paragraph_chunk.get("term_similarity", 0.0),
+                                            "vector": best_paragraph_chunk.get("vector", []),
+                                            "positions": best_paragraph_chunk.get("positions", []),
+                                            "doc_type_kwd": section_chunk.get("doc_type_kwd", ""),
+                                            "section_path": section_path_from_chunk
+                                        }
+                                        if highlight and "highlight" in best_paragraph_chunk:
+                                            section_chunk_dict["highlight"] = best_paragraph_chunk.get("highlight", "")
+                                        aggregated_chunks.append(section_chunk_dict)
+                                        seen_section_ids.add(parent_section_id)
+                                else:
+                                    # 没有 parent_section_id 的 chunk，直接添加（可能是其他类型的 chunk）
+                                    aggregated_chunks.append(chunk)
+                            
+                            # 更新 ranks["chunks"]
+                            ranks["chunks"] = aggregated_chunks[:page_size]
 
         return ranks
 
