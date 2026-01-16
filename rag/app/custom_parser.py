@@ -1720,22 +1720,8 @@ class CustomPdfParser:
                     if not any(variant in kept_titles_set for variant in block_content_variants):
                         continue
                 
-                # 先处理上一个未完成的段落（如果有）
-                if last_text_block:
-                    paragraph_counter += 1
-                    para_chunk_id = f"{filename}_para_{paragraph_counter}"
-                    paragraph = {
-                        "content": last_text_block.get("block_content", "").strip(),
-                        "page_index": last_page_index or 1,
-                        "section_path": current_section_path.copy(),
-                        "parent_section_id": get_parent_section_id(para_chunk_id),
-                        "chunk_id": para_chunk_id
-                    }
-                    paragraphs.append(paragraph)
-                    if current_section:
-                        current_section_paragraph_ids.append(para_chunk_id)
-                    last_text_block = None
-                    last_page_index = None
+                # 注意：不在这里处理last_text_block，让后续的else分支（第2013行）统一处理
+                # 这样可以避免重复处理，并且可以统一处理pending_short_paragraphs和last_text_block
                 
                 # 处理当前标题
                 # 获取标题的模式信息（block_content 已保留前导空格）
@@ -1845,6 +1831,19 @@ class CustomPdfParser:
                     # 这是因为 PaddleOCR 错误地将一个段落识别为两个段落
                     combined_content = last_text_block.get("block_content", "").strip() + block_content
                     
+                    # 如果last_text_block是短段落，并且已经在pending_short_paragraphs中，需要移除它
+                    # 因为跨页合并已经处理了这个短段落
+                    if pending_short_paragraphs:
+                        last_block_content = last_text_block.get("block_content", "").strip()
+                        # 检查pending_short_paragraphs中是否有与last_text_block相同的内容
+                        pending_short_paragraphs = [
+                            p for p in pending_short_paragraphs 
+                            if p.get("block_content", "").strip() != last_block_content
+                        ]
+                        # 如果pending_short_paragraphs被清空，重置pending_short_paragraphs_page_index
+                        if not pending_short_paragraphs:
+                            pending_short_paragraphs_page_index = None
+                    
                     # 如果合并后的内容仍然是短段落，且当前block也是短段落，加入待合并列表
                     if self.enable_short_paragraph_merge and is_short and self._is_short_paragraph(combined_content):
                         # 清空last_text_block，将合并后的内容加入待合并列表
@@ -1875,19 +1874,28 @@ class CustomPdfParser:
                         last_page_index = None
                 elif is_short and self.enable_short_paragraph_merge:
                     # 当前block是短段落，先处理上一个非短段落（如果有）
+                    # 注意：如果last_text_block是短段落，并且已经在pending_short_paragraphs中，不应该重复处理
                     if last_text_block:
-                        paragraph_counter += 1
-                        para_chunk_id = f"{filename}_para_{paragraph_counter}"
-                        paragraph = {
-                            "content": last_text_block.get("block_content", "").strip(),
-                            "page_index": last_page_index or 1,
-                            "section_path": current_section_path.copy(),
-                            "parent_section_id": get_parent_section_id(para_chunk_id),
-                            "chunk_id": para_chunk_id
-                        }
-                        paragraphs.append(paragraph)
-                        if current_section:
-                            current_section_paragraph_ids.append(para_chunk_id)
+                        last_block_content = last_text_block.get("block_content", "").strip()
+                        # 检查last_text_block是否已经在pending_short_paragraphs中
+                        is_in_pending = any(
+                            p.get("block_content", "").strip() == last_block_content 
+                            for p in pending_short_paragraphs
+                        )
+                        # 只有当last_text_block不在pending_short_paragraphs中时，才处理它
+                        if not is_in_pending:
+                            paragraph_counter += 1
+                            para_chunk_id = f"{filename}_para_{paragraph_counter}"
+                            paragraph = {
+                                "content": last_block_content,
+                                "page_index": last_page_index or 1,
+                                "section_path": current_section_path.copy(),
+                                "parent_section_id": get_parent_section_id(para_chunk_id),
+                                "chunk_id": para_chunk_id
+                            }
+                            paragraphs.append(paragraph)
+                            if current_section:
+                                current_section_paragraph_ids.append(para_chunk_id)
                         last_text_block = None
                         last_page_index = None
                     
@@ -1898,8 +1906,23 @@ class CustomPdfParser:
                         "block_content": block_content,
                         "page_index": page_index
                     })
+                    
+                    # 保存当前 text block，等待下一个 block 判断是否需要跨页拼接
+                    # 即使是短段落，也需要保存，以便与下一个 text block 进行跨页合并
+                    block_page_index = block.get("page_index", page_index)
+                    last_text_block = block
+                    last_page_index = block_page_index
                 else:
                     # 当前block不是短段落，先处理待合并的短段落（如果有）
+                    # 在处理pending_short_paragraphs之前，先检查last_text_block是否在其中
+                    last_block_in_pending = False
+                    if last_text_block and pending_short_paragraphs:
+                        last_block_content = last_text_block.get("block_content", "").strip()
+                        last_block_in_pending = any(
+                            p.get("block_content", "").strip() == last_block_content 
+                            for p in pending_short_paragraphs
+                        )
+                    
                     if pending_short_paragraphs:
                         merged_content_parts = [p["block_content"] for p in pending_short_paragraphs]
                         merged_content = "\n".join(merged_content_parts)
@@ -1938,7 +1961,8 @@ class CustomPdfParser:
                         pending_short_paragraphs_page_index = None
                     
                     # 处理上一个非短段落（如果有）
-                    if last_text_block:
+                    # 注意：如果last_text_block已经在pending_short_paragraphs中被处理了，不应该重复处理
+                    if last_text_block and not last_block_in_pending:
                         paragraph_counter += 1
                         para_chunk_id = f"{filename}_para_{paragraph_counter}"
                         paragraph = {
@@ -1963,6 +1987,15 @@ class CustomPdfParser:
                 # 这样 page N 的最后一个 text 和 page N+1 的第一个 text 可以合并
                 if block_label == "paragraph_title":
                     # 如果遇到标题，先处理待合并的短段落（如果有）
+                    # 在处理pending_short_paragraphs之前，先检查last_text_block是否在其中
+                    last_block_in_pending = False
+                    if last_text_block and pending_short_paragraphs:
+                        last_block_content = last_text_block.get("block_content", "").strip()
+                        last_block_in_pending = any(
+                            p.get("block_content", "").strip() == last_block_content 
+                            for p in pending_short_paragraphs
+                        )
+                    
                     if pending_short_paragraphs:
                         merged_content_parts = [p["block_content"] for p in pending_short_paragraphs]
                         merged_content = "\n".join(merged_content_parts)
@@ -2001,7 +2034,8 @@ class CustomPdfParser:
                         pending_short_paragraphs_page_index = None
                     
                     # 如果遇到标题，上一个 text block 应该单独成段
-                    if last_text_block:
+                    # 注意：如果last_text_block已经在pending_short_paragraphs中被处理了，不应该重复处理
+                    if last_text_block and not last_block_in_pending:
                         paragraph_counter += 1
                         para_chunk_id = f"{filename}_para_{paragraph_counter}"
                         paragraph = {
@@ -2020,6 +2054,15 @@ class CustomPdfParser:
         
         # 处理最后一个未完成的段落
         # 先处理待合并的短段落（如果有）
+        # 在处理pending_short_paragraphs之前，先检查last_text_block是否在其中
+        last_block_in_pending = False
+        if last_text_block and pending_short_paragraphs:
+            last_block_content = last_text_block.get("block_content", "").strip()
+            last_block_in_pending = any(
+                p.get("block_content", "").strip() == last_block_content 
+                for p in pending_short_paragraphs
+            )
+        
         if pending_short_paragraphs:
             merged_content_parts = [p["block_content"] for p in pending_short_paragraphs]
             merged_content = "\n".join(merged_content_parts)
@@ -2055,7 +2098,8 @@ class CustomPdfParser:
                         current_section_paragraph_ids.append(para_chunk_id)
         
         # 处理最后一个非短段落（如果有）
-        if last_text_block:
+        # 注意：如果last_text_block已经在pending_short_paragraphs中被处理了，不应该重复处理
+        if last_text_block and not last_block_in_pending:
             paragraph_counter += 1
             para_chunk_id = f"{filename}_para_{paragraph_counter}"
             paragraph = {
