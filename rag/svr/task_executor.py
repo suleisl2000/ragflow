@@ -310,7 +310,18 @@ async def build_chunks(task, progress_callback):
         try:
             d = copy.deepcopy(document)
             d.update(chunk)
-            d["id"] = xxhash.xxh64((chunk["content_with_weight"] + str(d["doc_id"])).encode("utf-8", "surrogatepass")).hexdigest()
+            # 根据chunk_type选择使用section_path还是content_with_weight生成id
+            chunk_type = chunk.get("chunk_type", "")
+            if chunk_type == "section":
+                # section chunks的id已经在custom_parser中生成（使用section_path + doc_id的xxhash），这里保留
+                # 如果id为空，则使用section_path + doc_id生成（兼容旧数据）
+                if not d.get("id"):
+                    section_path = chunk.get("section_path", "")
+                    d["id"] = xxhash.xxh64((section_path + str(d["doc_id"])).encode("utf-8", "surrogatepass")).hexdigest()
+            else:
+                # paragraph chunks和其他chunks使用content_with_weight + doc_id生成id
+                d["id"] = xxhash.xxh64((chunk["content_with_weight"] + str(d["doc_id"])).encode("utf-8", "surrogatepass")).hexdigest()
+                # paragraph chunks的parent_section_id已经在custom_parser中生成（使用section_path + doc_id的xxhash），这里保留
             d["create_time"] = str(datetime.now()).replace("T", " ")[:19]
             d["create_timestamp_flt"] = datetime.now().timestamp()
             if not d.get("image"):
@@ -756,6 +767,9 @@ async def insert_es(task_id, task_tenant_id, task_dataset_id, chunks, progress_c
     for chunk in chunks:
         chunk_type = chunk.get("chunk_type", "")
         if chunk_type == "section":
+            chunk_id = chunk.get("id", "")
+            section_path = chunk.get("section_path", "")
+            logging.info(f"[task_executor] 准备插入section_chunk: id={chunk_id}, section_path={section_path[:60] if section_path else ''}")
             section_chunks.append(chunk)
         else:
             paragraph_chunks.append(chunk)
@@ -777,8 +791,18 @@ async def insert_es(task_id, task_tenant_id, task_dataset_id, chunks, progress_c
     
     # 插入章节级 chunks（用于返回）
     if section_chunks:
+        # 调试：记录插入前的section_chunks的id
+        for i, chunk in enumerate(section_chunks[:3]):
+            chunk_id = chunk.get("id", "")
+            section_path = chunk.get("section_path", "")
+            logging.info(f"[task_executor] 插入前section_chunk[{i}]: id={chunk_id}, section_path={section_path[:60] if section_path else ''}")
         for b in range(0, len(section_chunks), DOC_BULK_SIZE):
-            doc_store_result = await trio.to_thread.run_sync(lambda: settings.docStoreConn.insert_sections(section_chunks[b:b + DOC_BULK_SIZE], search.index_name(task_tenant_id), task_dataset_id))
+            batch_chunks = section_chunks[b:b + DOC_BULK_SIZE]
+            # 调试：记录批次插入前的id
+            batch_ids = [chunk.get("id", "") for chunk in batch_chunks[:3]]
+            batch_paths = [chunk.get("section_path", "")[:60] for chunk in batch_chunks[:3]]
+            logging.info(f"[task_executor] 批次插入section_chunks: 批次大小={len(batch_chunks)}, 前3个ids={batch_ids}, 前3个paths={batch_paths}")
+            doc_store_result = await trio.to_thread.run_sync(lambda: settings.docStoreConn.insert_sections(batch_chunks, search.index_name(task_tenant_id), task_dataset_id))
             task_canceled = has_canceled(task_id)
             if task_canceled:
                 progress_callback(-1, msg="Task has been canceled.")
