@@ -769,7 +769,7 @@ async def insert_es(task_id, task_tenant_id, task_dataset_id, chunks, progress_c
         if chunk_type == "section":
             chunk_id = chunk.get("id", "")
             section_path = chunk.get("section_path", "")
-            logging.info(f"[task_executor] 准备插入section_chunk: id={chunk_id}, section_path={section_path[:60] if section_path else ''}")
+            logging.debug(f"[task_executor] 准备插入section_chunk: id={chunk_id}, section_path={section_path[:60] if section_path else ''}")
             section_chunks.append(chunk)
         else:
             paragraph_chunks.append(chunk)
@@ -795,13 +795,13 @@ async def insert_es(task_id, task_tenant_id, task_dataset_id, chunks, progress_c
         for i, chunk in enumerate(section_chunks[:3]):
             chunk_id = chunk.get("id", "")
             section_path = chunk.get("section_path", "")
-            logging.info(f"[task_executor] 插入前section_chunk[{i}]: id={chunk_id}, section_path={section_path[:60] if section_path else ''}")
+            logging.debug(f"[task_executor] 插入前section_chunk[{i}]: id={chunk_id}, section_path={section_path[:60] if section_path else ''}")
         for b in range(0, len(section_chunks), DOC_BULK_SIZE):
             batch_chunks = section_chunks[b:b + DOC_BULK_SIZE]
             # 调试：记录批次插入前的id
             batch_ids = [chunk.get("id", "") for chunk in batch_chunks[:3]]
             batch_paths = [chunk.get("section_path", "")[:60] for chunk in batch_chunks[:3]]
-            logging.info(f"[task_executor] 批次插入section_chunks: 批次大小={len(batch_chunks)}, 前3个ids={batch_ids}, 前3个paths={batch_paths}")
+            logging.debug(f"[task_executor] 批次插入section_chunks: 批次大小={len(batch_chunks)}, 前3个ids={batch_ids}, 前3个paths={batch_paths}")
             doc_store_result = await trio.to_thread.run_sync(lambda: settings.docStoreConn.insert_sections(batch_chunks, search.index_name(task_tenant_id), task_dataset_id))
             task_canceled = has_canceled(task_id)
             if task_canceled:

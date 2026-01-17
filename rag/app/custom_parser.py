@@ -604,29 +604,28 @@ class CustomPdfParser:
             "pdf-cache"
         )
         
-        # 根据OCR类型确定结果缓存bucket
+        # 初始化所有OCR类型的bucket配置（用于自适应缓存查找）
+        self.textin_cache_bucket = (
+            os.environ.get("TEXTIN_CACHE_BUCKET") or
+            self.custom_config.get("textin_cache_bucket") or
+            get_base_config("textin_cache_bucket") or
+            "textin-cache"
+        )
+        self.paddleocr_cache_bucket = (
+            os.environ.get("PADDLEOCR_CACHE_BUCKET") or
+            self.custom_config.get("paddleocr_cache_bucket") or
+            get_base_config("paddleocr_cache_bucket") or
+            "paddleocr-cache"
+        )
+        
+        # 根据OCR类型确定结果缓存bucket（用于保存缓存）
         if self.ocr_type == "paddleocr":
-            self.result_cache_bucket = (
-                os.environ.get("PADDLEOCR_CACHE_BUCKET") or
-                self.custom_config.get("paddleocr_cache_bucket") or
-                get_base_config("paddleocr_cache_bucket") or
-                "paddleocr-cache"
-            )
+            self.result_cache_bucket = self.paddleocr_cache_bucket
         elif self.ocr_type == "textin":
-            self.result_cache_bucket = (
-                os.environ.get("TEXTIN_CACHE_BUCKET") or
-                self.custom_config.get("textin_cache_bucket") or
-                get_base_config("textin_cache_bucket") or
-                "textin-cache"
-            )
+            self.result_cache_bucket = self.textin_cache_bucket
         else:
             # 默认使用 textin-cache（向后兼容）
-            self.result_cache_bucket = (
-                os.environ.get("TEXTIN_CACHE_BUCKET") or
-                self.custom_config.get("textin_cache_bucket") or
-                get_base_config("textin_cache_bucket") or
-                "textin-cache"
-            )
+            self.result_cache_bucket = self.textin_cache_bucket
     
     def _init_llm_model(self):
         """初始化LLM模型用于关键词生成（索引构建时）"""
@@ -674,7 +673,7 @@ class CustomPdfParser:
         
         # 检查缓存
         if cache_key in self._keyword_cache:
-            logger.info(f"Cache hit for keywords: {context}")
+            logger.debug(f"Cache hit for keywords: {context}")
             print(f"Cache hit for keywords: {context}")
             return self._keyword_cache[cache_key]
         
@@ -865,65 +864,67 @@ class CustomPdfParser:
         """计算PDF的MD5值"""
         return hashlib.md5(binary).hexdigest()
     
-    def _get_cached_result(self, md5: str) -> Optional[bytes]:
-        """从对象存储获取缓存的OCR结果（按文档目录结构组织）"""
+    def _get_cached_result(self, md5: str) -> Optional[Tuple[bytes, str]]:
+        """
+        自适应查找OCR缓存，优先使用已有缓存（无论OCR类型）
+        
+        Returns:
+            Optional[Tuple[bytes, str]]: (缓存数据, OCR类型) 或 None
+        """
         try:
-            bucket = self.result_cache_bucket
-            if self.ocr_type == "paddleocr":
-                # PaddleOCR: 按照 paddle_ocr.py 的目录结构读取每页的 JSON 文件并合并
-                # 目录结构：{md5}/json/{md5}_page{page_idx:03d}.json
-                logger.debug(f"[缓存] 从每页JSON文件读取并合并: MD5={md5}")
-                all_pruned_results = []
-                page_idx = 0
-                while True:
-                    json_key = f"{md5}/json/{md5}_page{page_idx:03d}.json"
-                    if not STORAGE_IMPL.obj_exist(bucket, json_key):
-                        break
-                    json_binary = STORAGE_IMPL.get(bucket, json_key)
-                    try:
-                        pruned_result = json.loads(json_binary.decode('utf-8'))
-                        all_pruned_results.append(pruned_result)
-                    except Exception as e:
-                        logger.warning(f"[缓存] 解析页面JSON失败: {json_key}, 错误: {e}")
-                    page_idx += 1
-                
-                if all_pruned_results:
-                    # 构建统一的 JSON 结构（与 _call_ocr_api 保持一致）
-                    merged_json = {
-                        "prunedResult": {
-                            "model_settings": all_pruned_results[0].get("model_settings", {}) if all_pruned_results else {},
-                            "parsing_res_list": []
-                        }
+            # 1. 先查 Textin 缓存
+            textin_key = f"{md5}/json/{md5}.json"
+            logger.debug(f"[缓存] 检查Textin缓存: bucket={self.textin_cache_bucket}, key={textin_key}")
+            if STORAGE_IMPL.obj_exist(self.textin_cache_bucket, textin_key):
+                result_binary = STORAGE_IMPL.get(self.textin_cache_bucket, textin_key)
+                logger.info(f"[缓存] ✓ Textin OCR结果缓存命中: MD5={md5}, 大小={len(result_binary)} bytes")
+                return result_binary, "textin"
+            
+            # 2. 再查 PaddleOCR 缓存
+            logger.debug(f"[缓存] 检查PaddleOCR缓存: bucket={self.paddleocr_cache_bucket}, MD5={md5}")
+            all_pruned_results = []
+            page_idx = 0
+            while True:
+                json_key = f"{md5}/json/{md5}_page{page_idx:03d}.json"
+                if not STORAGE_IMPL.obj_exist(self.paddleocr_cache_bucket, json_key):
+                    break
+                json_binary = STORAGE_IMPL.get(self.paddleocr_cache_bucket, json_key)
+                try:
+                    pruned_result = json.loads(json_binary.decode('utf-8'))
+                    all_pruned_results.append(pruned_result)
+                except Exception as e:
+                    logger.warning(f"[缓存] 解析PaddleOCR页面JSON失败: {json_key}, 错误: {e}")
+                page_idx += 1
+            
+            if all_pruned_results:
+                # 构建统一的 JSON 结构（与 _call_ocr_api 保持一致）
+                merged_json = {
+                    "prunedResult": {
+                        "model_settings": all_pruned_results[0].get("model_settings", {}) if all_pruned_results else {},
+                        "parsing_res_list": []
                     }
-                    
-                    # 合并所有页面的 parsing_res_list，并添加页码信息
-                    for page_idx, pruned_result in enumerate(all_pruned_results):
-                        parsing_res_list = pruned_result.get("parsing_res_list", [])
-                        for block in parsing_res_list:
-                            # 添加页码信息到每个 block
-                            block_with_page = block.copy()
-                            block_with_page["page_index"] = page_idx + 1  # 页码从1开始
-                            merged_json["prunedResult"]["parsing_res_list"].append(block_with_page)
-                    
-                    result_binary = json.dumps(merged_json, ensure_ascii=False).encode('utf-8')
-                    logger.info(f"[缓存] ✓ OCR结果缓存命中: MD5={md5}, OCR类型={self.ocr_type}, 大小={len(result_binary)} bytes, 共 {len(all_pruned_results)} 页")
-                    return result_binary
-                else:
-                    logger.debug(f"[缓存] ✗ OCR结果缓存未命中: MD5={md5}, OCR类型={self.ocr_type}")
-            else:
-                # Textin: 读取 JSON 文件
-                cache_key = f"{md5}/json/{md5}.json"
-                logger.debug(f"[缓存] 检查OCR结果缓存: bucket={bucket}, key={cache_key}, OCR类型={self.ocr_type}")
+                }
                 
-                if STORAGE_IMPL.obj_exist(bucket, cache_key):
-                    result_binary = STORAGE_IMPL.get(bucket, cache_key)
-                    logger.info(f"[缓存] ✓ OCR结果缓存命中: MD5={md5}, OCR类型={self.ocr_type}, 大小={len(result_binary)} bytes")
-                    return result_binary
-                else:
-                    logger.debug(f"[缓存] ✗ OCR结果缓存未命中: MD5={md5}, OCR类型={self.ocr_type}")
+                # 合并所有页面的 parsing_res_list，并添加页码信息
+                for page_idx, pruned_result in enumerate(all_pruned_results):
+                    parsing_res_list = pruned_result.get("parsing_res_list", [])
+                    for block in parsing_res_list:
+                        # 添加页码信息到每个 block
+                        block_with_page = block.copy()
+                        block_with_page["page_index"] = page_idx + 1  # 页码从1开始
+                        merged_json["prunedResult"]["parsing_res_list"].append(block_with_page)
+                
+                result_binary = json.dumps(merged_json, ensure_ascii=False).encode('utf-8')
+                logger.info(f"[缓存] ✓ PaddleOCR结果缓存命中: MD5={md5}, 大小={len(result_binary)} bytes, 共 {len(all_pruned_results)} 页")
+                return result_binary, "paddleocr"
+            
+            # 3. 都未找到，返回None（将使用当前配置的OCR类型调用API）
+            logger.debug(f"[缓存] ✗ OCR结果缓存未命中: MD5={md5}, 将使用当前配置的OCR类型({self.ocr_type})调用API")
+            return None, None
+            
         except Exception as e:
-            logger.warning(f"[缓存] 获取OCR结果缓存失败: MD5={md5}, OCR类型={self.ocr_type}, 错误: {e}", exc_info=True)
-        return None
+            logger.warning(f"[缓存] 获取OCR结果缓存失败: MD5={md5}, 错误: {e}", exc_info=True)
+        return None, None
     
     def _save_to_cache(self, md5: str, pdf_binary: bytes, result_binary: bytes, full_response: Dict[str, Any] = None):
         """
@@ -1261,22 +1262,30 @@ class CustomPdfParser:
             md5 = self._calculate_pdf_md5(binary)
             logger.info(f"[PDF解析] PDF文件MD5: {md5}")
             
-            # 2. 检查缓存
-            logger.info(f"[PDF解析] 检查缓存 (bucket: {self.result_cache_bucket}, OCR类型: {self.ocr_type})")
-            cached_result = self._get_cached_result(md5)
-            if cached_result:
-                logger.info(f"[PDF解析] ✓ 缓存命中，使用缓存结果: {filename} (MD5: {md5}), 结果大小: {len(cached_result)} bytes")
+            # 2. 自适应检查缓存（优先使用已有缓存，无论OCR类型）
+            logger.info(f"[PDF解析] 自适应检查缓存 (Textin bucket: {self.textin_cache_bucket}, PaddleOCR bucket: {self.paddleocr_cache_bucket})")
+            cached_result, cached_ocr_type = self._get_cached_result(md5)
+            if cached_result and cached_ocr_type:
+                logger.info(f"[PDF解析] ✓ 缓存命中，使用缓存结果: {filename} (MD5: {md5}), OCR类型: {cached_ocr_type}, 结果大小: {len(cached_result)} bytes")
                 
-                # 根据 OCR 类型解析缓存
-                if self.ocr_type == "paddleocr":
-                    # PaddleOCR 缓存的是 JSON 数据
-                    chunks = self._parse_paddleocr_json_file(filename, cached_result, **kwargs)
-                else:
-                    # Textin 缓存的是 JSON
-                    chunks = self._parse_json_file(filename, cached_result, **kwargs)
+                # 临时设置ocr_type以使用对应的解析方法
+                original_ocr_type = self.ocr_type
+                self.ocr_type = cached_ocr_type
                 
-                logger.info(f"[PDF解析] 缓存结果解析完成，生成 {len(chunks)} 个chunks")
-                return chunks
+                try:
+                    # 根据缓存的 OCR 类型解析缓存
+                    if cached_ocr_type == "paddleocr":
+                        # PaddleOCR 缓存的是 JSON 数据
+                        chunks = self._parse_paddleocr_json_file(filename, cached_result, **kwargs)
+                    else:
+                        # Textin 缓存的是 JSON
+                        chunks = self._parse_json_file(filename, cached_result, **kwargs)
+                    
+                    logger.info(f"[PDF解析] 缓存结果解析完成，生成 {len(chunks)} 个chunks")
+                    return chunks
+                finally:
+                    # 恢复原始ocr_type
+                    self.ocr_type = original_ocr_type
             
             logger.info(f"[PDF解析] ✗ 缓存未命中，需要调用OCR API")
             

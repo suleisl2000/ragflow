@@ -497,17 +497,35 @@ class Dealer:
                             aggregated_chunks = []
                             seen_section_ids = set()  # 使用 parent_section_id 来去重
                             section_similarity_map = {}  # {parent_section_id: max_similarity_chunk}
+                            section_chunk_count = {}  # {parent_section_id: count} 统计每个章节被召回的段落chunks数量
                             
-                            # 第一遍：找到每个 parent_section_id 的最高相似度段落 chunk
+                            # 第一遍：找到每个 parent_section_id 的最高相似度段落 chunk，并统计数量
                             for chunk in ranks["chunks"]:
                                 parent_section_id = chunk.get("parent_section_id", "")
                                 if parent_section_id and parent_section_id in section_chunks:
+                                    # 统计该章节被召回的段落chunks数量
+                                    section_chunk_count[parent_section_id] = section_chunk_count.get(parent_section_id, 0) + 1
+                                    
                                     similarity = chunk.get("similarity", 0.0)
                                     if parent_section_id not in section_similarity_map:
                                         section_similarity_map[parent_section_id] = chunk
                                     else:
                                         if similarity > section_similarity_map[parent_section_id].get("similarity", 0.0):
                                             section_similarity_map[parent_section_id] = chunk
+                            
+                            # 应用多chunks奖励：对每个章节根据被召回的段落chunks数量应用奖励系数
+                            # 奖励公式：reward_factor = 1.0 + min(chunk_count - 1, 10) * 0.025
+                            # 2个chunks: 1.025, 3个: 1.05, 5个: 1.10, 11+: 1.25
+                            for section_id, chunk_count in section_chunk_count.items():
+                                if chunk_count > 1 and section_id in section_similarity_map:
+                                    reward_factor = 1.0 + min(chunk_count - 1, 10) * 0.025
+                                    original_similarity = section_similarity_map[section_id].get("similarity", 0.0)
+                                    section_similarity_map[section_id]["similarity"] = original_similarity * reward_factor
+                                    # 同时更新vector_similarity和term_similarity（保持比例）
+                                    if "vector_similarity" in section_similarity_map[section_id]:
+                                        section_similarity_map[section_id]["vector_similarity"] *= reward_factor
+                                    if "term_similarity" in section_similarity_map[section_id]:
+                                        section_similarity_map[section_id]["term_similarity"] *= reward_factor
                             
                             # 第二遍：构建返回结果（每个 parent_section_id 只添加一次）
                             for chunk in ranks["chunks"]:

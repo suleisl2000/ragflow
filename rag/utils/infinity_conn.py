@@ -641,7 +641,7 @@ class InfinityConnection(DocStoreConnection):
                 )
             
             table_instance = inf_table
-            logger.info(f"INFINITY created section table {table_name}")
+            logger.debug(f"INFINITY created section table {table_name}")
         
         # 处理文档数据
         docs = copy.deepcopy(documents)
@@ -699,7 +699,7 @@ class InfinityConnection(DocStoreConnection):
         table_instance.insert(docs)
         self.connPool.release_conn(inf_conn)
         
-        logger.info(f"INFINITY inserted {len(docs)} sections into section table {table_name}")
+        logger.debug(f"INFINITY inserted {len(docs)} sections into section table {table_name}")
         return []
     
     def get_sections_by_ids(self, section_ids: list[str], indexName: str, knowledgebaseId: str = None) -> dict[str, dict]:

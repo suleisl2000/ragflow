@@ -177,7 +177,7 @@ class Base(ABC):
         duration = time.time() - start_time
 
         if not response or not getattr(response, "choices", None) or not response.choices or not response.choices[0].message or not response.choices[0].message.content:
-            logging.info(
+            logging.debug(
                 "[LLM_CALL_DONE][Base._chat] model=%s duration=%.3fs but got empty response",
                 self.model_name,
                 duration,
@@ -189,7 +189,7 @@ class Base(ABC):
             ans = self._length_stop(ans)
 
         total_tokens = self.total_token_count(response)
-        logging.info(
+        logging.debug(
             "[LLM_CALL_DONE][Base._chat] model=%s duration=%.3fs total_tokens=%s finish_reason=%s len(ans)=%d",
             self.model_name,
             duration,
