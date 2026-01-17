@@ -1480,16 +1480,13 @@ class CustomPdfParser:
         if pattern_key in pattern_to_level:
             return pattern_to_level[pattern_key]
         
-        # 如果是第一个标题，分配 level 1
-        if not pattern_to_level:
-            pattern_to_level[pattern_key] = 1
-            return 1
-        
         # 找到当前已分配的最大 level
-        max_level = max(pattern_to_level.values()) if pattern_to_level else 0
+        # 注意：adjust_title_levels 返回的 level 从 2 开始（对应 markdown 的 ##），所以这里也要从 2 开始
+        max_level = max(pattern_to_level.values()) if pattern_to_level else 1  # 如果为空，从 1 开始，下一个是 2
         
         # 新模式的 level = max_level + 1
-        new_level = max_level + 1
+        # 确保至少从 2 开始（与 adjust_title_levels 保持一致）
+        new_level = max(max_level + 1, 2)
         pattern_to_level[pattern_key] = new_level
         
         logger.debug(f"[动态Level判定] 标题 '{title_text}' 模式 ({pattern_priority}, {dot_count}) 分配 level {new_level}")
@@ -1761,9 +1758,6 @@ class CustomPdfParser:
         current_section: Optional[Dict[str, Any]] = None
         current_section_paragraph_ids: List[str] = []
         
-        # 保存上一个标题的 level（用于判断是同级标题还是子级标题）
-        last_title_level: Optional[int] = None
-        
         # 跨页段落拼接：存储上一个页面的最后一个 text block
         last_text_block: Optional[Dict[str, Any]] = None
         last_page_index: Optional[int] = None
@@ -1939,13 +1933,26 @@ class CustomPdfParser:
                         current_section_path.pop()
                     
                     # 判断是同级标题还是子级标题
-                    # 如果 path_depth == len(current_section_path) 且 last_title_level == level，说明是同级标题，需要替换最后一个
-                    # 否则，说明是子级标题或更高级的标题，需要追加或替换
-                    if (len(current_section_path) == path_depth and 
-                        len(current_section_path) > 0 and 
-                        last_title_level is not None and 
-                        last_title_level == level):
-                        # 同级标题，替换最后一个
+                    # 关键：使用和"章节层级详情"完全一样的逻辑，直接从 pattern_to_level 获取路径中最后一个标题的 level
+                    # 如果 level 相同，说明是同级标题，需要替换最后一个（不管 path_depth 是否等于 len(current_section_path)）
+                    # 如果 level 不同，说明是子级标题或更高级的标题，需要追加或替换
+                    # 注意：如果 path_depth < len(current_section_path)，说明是更高级的标题，已经通过上面的 while 循环截断了
+                    last_title_level_in_path = None
+                    if len(current_section_path) > 0:
+                        # 从路径中最后一个标题获取其 level（使用和"章节层级详情"完全一样的逻辑）
+                        last_title_content = current_section_path[-1]
+                        last_priority, last_dot_count = get_title_pattern_info(last_title_content)
+                        if last_priority >= 0:
+                            last_pattern_key = (last_priority, last_dot_count)
+                            if last_pattern_key in pattern_to_level:
+                                last_title_level_in_path = pattern_to_level[last_pattern_key]
+                    
+                    # 判断同级标题：只要 level 相同，就是同级标题，需要替换最后一个
+                    # 使用和"章节层级详情"完全一样的逻辑：如果两个标题的 level 相同（都来自 adjust_title_levels），那么它们是同级的
+                    if (len(current_section_path) > 0 and 
+                        last_title_level_in_path is not None and
+                        last_title_level_in_path == level):
+                        # 同级标题（level 相同），替换最后一个
                         current_section_path[-1] = block_content
                     else:
                         # 子级标题或更高级的标题，追加到路径
@@ -1956,9 +1963,6 @@ class CustomPdfParser:
                         else:
                             # 这种情况理论上不应该发生，但为了安全起见，还是追加
                             current_section_path.append(block_content)
-                    
-                    # 保存当前标题的 level，用于下一个标题的判断
-                    last_title_level = level
                     
                     # 创建新章节
                     # 标准化 section_path 用于存储（去掉前导和尾随空格）
