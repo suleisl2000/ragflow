@@ -920,11 +920,11 @@ class CustomPdfParser:
             
             # 3. 都未找到，返回None（将使用当前配置的OCR类型调用API）
             logger.debug(f"[缓存] ✗ OCR结果缓存未命中: MD5={md5}, 将使用当前配置的OCR类型({self.ocr_type})调用API")
-            return None, None
+            return None
             
         except Exception as e:
             logger.warning(f"[缓存] 获取OCR结果缓存失败: MD5={md5}, 错误: {e}", exc_info=True)
-        return None, None
+            return None
     
     def _save_to_cache(self, md5: str, pdf_binary: bytes, result_binary: bytes, full_response: Dict[str, Any] = None):
         """
@@ -1264,8 +1264,9 @@ class CustomPdfParser:
             
             # 2. 自适应检查缓存（优先使用已有缓存，无论OCR类型）
             logger.info(f"[PDF解析] 自适应检查缓存 (Textin bucket: {self.textin_cache_bucket}, PaddleOCR bucket: {self.paddleocr_cache_bucket})")
-            cached_result, cached_ocr_type = self._get_cached_result(md5)
-            if cached_result and cached_ocr_type:
+            cached_result_tuple = self._get_cached_result(md5)
+            if cached_result_tuple is not None:
+                cached_result, cached_ocr_type = cached_result_tuple
                 logger.info(f"[PDF解析] ✓ 缓存命中，使用缓存结果: {filename} (MD5: {md5}), OCR类型: {cached_ocr_type}, 结果大小: {len(cached_result)} bytes")
                 
                 # 临时设置ocr_type以使用对应的解析方法
