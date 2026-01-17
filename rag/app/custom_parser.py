@@ -1766,6 +1766,10 @@ class CustomPdfParser:
         # 段落计数器（用于生成段落 chunk ID）
         paragraph_counter = 0
         
+        # 标志：刚刚遇到了paragraph_title或doc_title（用于判断是否应该跨页合并）
+        # 如果为True，说明当前text block和last_text_block之间有标题，不应该跨页合并
+        just_encountered_title: bool = False
+        
         # 辅助函数：获取parent_section_id并添加调试日志
         # 注意：使用xxhash方式生成id（section_path + doc_id），与section chunk的id生成方式一致
         def get_parent_section_id(para_chunk_id: str) -> str:
@@ -1851,8 +1855,57 @@ class CustomPdfParser:
                     if not any(variant in kept_titles_set for variant in block_content_variants):
                         continue
                 
-                # 注意：不在这里处理last_text_block，让后续的else分支（第2013行）统一处理
-                # 这样可以避免重复处理，并且可以统一处理pending_short_paragraphs和last_text_block
+                # ========== 修复：先处理last_text_block，避免误触发跨页合并 ==========
+                # 如果遇到标题，先处理待合并的短段落（如果有）
+                last_block_in_pending = False
+                if last_text_block and pending_short_paragraphs:
+                    last_block_content = last_text_block.get("block_content", "").strip()
+                    last_block_in_pending = any(
+                        p.get("block_content", "").strip() == last_block_content 
+                        for p in pending_short_paragraphs
+                    )
+                
+                if pending_short_paragraphs:
+                    # 使用分批合并策略处理短段落
+                    paragraph_counter = self._merge_short_paragraphs_in_batches(
+                        pending_short_paragraphs,
+                        pending_short_paragraphs_page_index,
+                        current_section_path,
+                        get_parent_section_id,
+                        filename,
+                        paragraph_counter,
+                        paragraphs,
+                        current_section,
+                        current_section_paragraph_ids
+                    )
+                    pending_short_paragraphs = []
+                    pending_short_paragraphs_page_index = None
+                
+                # 如果遇到标题，上一个 text block 应该单独成段
+                # 注意：如果last_text_block已经在pending_short_paragraphs中被处理了，不应该重复处理
+                if last_text_block and not last_block_in_pending:
+                    paragraph_counter += 1
+                    para_chunk_id = f"{filename}_para_{paragraph_counter}"
+                    paragraph = {
+                        "content": last_text_block.get("block_content", "").strip(),
+                        "page_index": last_page_index or 1,
+                        "section_path": current_section_path.copy(),
+                        "parent_section_id": get_parent_section_id(para_chunk_id),
+                        "chunk_id": para_chunk_id
+                    }
+                    paragraphs.append(paragraph)
+                    if current_section:
+                        current_section_paragraph_ids.append(para_chunk_id)
+                
+                # ========== 修复：无论last_text_block是否被处理，都要清空，避免在else分支中重复处理 ==========
+                # 清空last_text_block，避免在else分支中重复处理
+                last_text_block = None
+                last_page_index = None
+                # ========== 修复结束 ==========
+                
+                # 设置标志：刚刚遇到了标题
+                just_encountered_title = True
+                # ========== 修复结束 ==========
                 
                 # 处理当前标题
                 # 获取标题的模式信息（block_content 已保留前导空格）
@@ -1956,8 +2009,11 @@ class CustomPdfParser:
                 # 判断是否为短段落
                 is_short = self._is_short_paragraph(block_content)
                 
-                # 检查是否需要跨页拼接（只有跨页且中间没有 paragraph_title 时才合并）
-                if last_text_block and last_page_index and page_index == last_page_index + 1:
+                # ========== 修复：检查中间是否有标题 ==========
+                # 检查是否需要跨页拼接（只有跨页且中间没有 paragraph_title/doc_title 时才合并）
+                # 如果just_encountered_title为True，说明中间有标题，不应该跨页合并
+                if last_text_block and last_page_index and page_index == last_page_index + 1 and not just_encountered_title:
+                # ========== 修复结束 ==========
                     # 跨页拼接：将上一个页面的最后一个 text 和当前页面的第一个 text 合并
                     # 这是因为 PaddleOCR 错误地将一个段落识别为两个段落
                     combined_content = last_text_block.get("block_content", "").strip() + block_content
@@ -2005,8 +2061,10 @@ class CustomPdfParser:
                         last_page_index = None
                 elif is_short and self.enable_short_paragraph_merge:
                     # 当前block是短段落，先处理上一个非短段落（如果有）
-                    # 注意：如果last_text_block是短段落，并且已经在pending_short_paragraphs中，不应该重复处理
-                    if last_text_block:
+                    # 注意：
+                    # 1. 如果last_text_block是短段落，并且已经在pending_short_paragraphs中，不应该重复处理
+                    # 2. 如果just_encountered_title为True，说明last_text_block已经在处理paragraph_title时被处理了，不应该重复处理
+                    if last_text_block and not just_encountered_title:
                         last_block_content = last_text_block.get("block_content", "").strip()
                         # 检查last_text_block是否已经在pending_short_paragraphs中
                         is_in_pending = any(
@@ -2071,9 +2129,13 @@ class CustomPdfParser:
                         pending_short_paragraphs = []
                         pending_short_paragraphs_page_index = None
                     
+                    # ========== 修复：如果just_encountered_title为True，说明last_text_block已经在处理paragraph_title时被处理了 ==========
                     # 处理上一个非短段落（如果有）
-                    # 注意：如果last_text_block已经在pending_short_paragraphs中被处理了，不应该重复处理
-                    if last_text_block and not last_block_in_pending:
+                    # 注意：
+                    # 1. 如果last_text_block已经在pending_short_paragraphs中被处理了，不应该重复处理
+                    # 2. 如果just_encountered_title为True，说明last_text_block已经在处理paragraph_title时被处理了，不应该重复处理
+                    if last_text_block and not last_block_in_pending and not just_encountered_title:
+                    # ========== 修复结束 ==========
                         paragraph_counter += 1
                         para_chunk_id = f"{filename}_para_{paragraph_counter}"
                         paragraph = {
@@ -2090,58 +2152,26 @@ class CustomPdfParser:
                     # 保存当前 text block，等待下一个 block 判断是否需要跨页拼接
                     last_text_block = block
                     last_page_index = page_index
+                    
+                    # ========== 修复：重置标志 ==========
+                    # 已经处理了text block，不再是"刚刚遇到标题"的状态
+                    just_encountered_title = False
+                    # ========== 修复结束 ==========
             
             # 忽略其他类型的 block（figure_title, table 等）
             else:
-                # 只有当遇到 paragraph_title 时，才处理上一个 text block
-                # 其他类型的 block（如 footnote、number、header 等）不应该中断跨页拼接
-                # 这样 page N 的最后一个 text 和 page N+1 的第一个 text 可以合并
-                if block_label == "paragraph_title":
-                    # 如果遇到标题，先处理待合并的短段落（如果有）
-                    # 在处理pending_short_paragraphs之前，先检查last_text_block是否在其中
-                    last_block_in_pending = False
-                    if last_text_block and pending_short_paragraphs:
-                        last_block_content = last_text_block.get("block_content", "").strip()
-                        last_block_in_pending = any(
-                            p.get("block_content", "").strip() == last_block_content 
-                            for p in pending_short_paragraphs
-                        )
-                    
-                    if pending_short_paragraphs:
-                        # 使用分批合并策略处理短段落
-                        paragraph_counter = self._merge_short_paragraphs_in_batches(
-                            pending_short_paragraphs,
-                            pending_short_paragraphs_page_index,
-                            current_section_path,
-                            get_parent_section_id,
-                            filename,
-                            paragraph_counter,
-                            paragraphs,
-                            current_section,
-                            current_section_paragraph_ids
-                        )
-                        
-                        pending_short_paragraphs = []
-                        pending_short_paragraphs_page_index = None
-                    
-                    # 如果遇到标题，上一个 text block 应该单独成段
-                    # 注意：如果last_text_block已经在pending_short_paragraphs中被处理了，不应该重复处理
-                    if last_text_block and not last_block_in_pending:
-                        paragraph_counter += 1
-                        para_chunk_id = f"{filename}_para_{paragraph_counter}"
-                        paragraph = {
-                            "content": last_text_block.get("block_content", "").strip(),
-                            "page_index": last_page_index or 1,
-                            "section_path": current_section_path.copy(),
-                            "parent_section_id": get_parent_section_id(para_chunk_id),
-                            "chunk_id": para_chunk_id
-                        }
-                        paragraphs.append(paragraph)
-                        if current_section:
-                            current_section_paragraph_ids.append(para_chunk_id)
-                        last_text_block = None
-                        last_page_index = None
+                # ========== 修复：移除else分支中的paragraph_title处理逻辑，避免重复处理 ==========
+                # paragraph_title已经在if分支中被处理了，不会进入else分支
+                # 如果paragraph_title被continue跳过了（比如不是有效标题），也不应该在这里处理last_text_block
+                # 因为无效的paragraph_title不应该影响段落的处理
                 # 其他类型的 block（footnote、number、header 等）不影响跨页拼接，直接跳过
+                # ========== 修复结束 ==========
+                
+                # ========== 修复：重置标志 ==========
+                # 其他类型的block（除了paragraph_title和doc_title）也会重置标志
+                # 这样确保只有紧跟在标题后面的text block才会检查just_encountered_title
+                just_encountered_title = False
+                # ========== 修复结束 ==========
         
         # 处理最后一个未完成的段落
         # 先处理待合并的短段落（如果有）
