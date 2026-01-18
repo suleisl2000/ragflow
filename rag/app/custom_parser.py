@@ -1521,6 +1521,35 @@ class CustomPdfParser:
         
         return False
     
+    def _get_section_path_from_context(self, current_section: Optional[Dict[str, Any]], 
+                                       current_section_path: List[str]) -> List[str]:
+        """
+        获取当前章节路径，优先从current_section获取，如果没有再从current_section_path获取
+        
+        Args:
+            current_section: 当前章节chunk对象
+            current_section_path: 当前章节路径列表
+        
+        Returns:
+            章节路径列表
+        """
+        if current_section:
+            # 优先从current_section获取section_path（确保与parent_section_id一致）
+            section_path_from_section = current_section.get("section_path", [])
+            if section_path_from_section:
+                # 如果是字符串，转换为列表
+                if isinstance(section_path_from_section, str):
+                    result = section_path_from_section.split(" > ") if section_path_from_section else []
+                    if result:
+                        return result
+                elif isinstance(section_path_from_section, list):
+                    result = section_path_from_section.copy()
+                    if result:
+                        return result
+        # 如果current_section没有section_path，使用current_section_path
+        result = current_section_path.copy() if current_section_path else []
+        return result
+    
     def _merge_short_paragraphs_in_batches(self, pending_short_paragraphs: List[Dict[str, Any]], 
                                            pending_short_paragraphs_page_index: Optional[int],
                                            current_section_path: List[str],
@@ -1564,7 +1593,7 @@ class CustomPdfParser:
             paragraph = {
                 "content": merged_content,
                 "page_index": pending_short_paragraphs_page_index or 1,
-                "section_path": current_section_path.copy(),
+                "section_path": self._get_section_path_from_context(current_section, current_section_path),
                 "parent_section_id": get_parent_section_id(para_chunk_id),
                 "chunk_id": para_chunk_id
             }
@@ -1601,7 +1630,7 @@ class CustomPdfParser:
                     paragraph = {
                         "content": batch_content,
                         "page_index": batch_page_index if batch_page_index is not None else (batch[0]["page_index"] if batch else 1),
-                        "section_path": current_section_path.copy(),
+                        "section_path": self._get_section_path_from_context(current_section, current_section_path),
                         "parent_section_id": get_parent_section_id(para_chunk_id),
                         "chunk_id": para_chunk_id
                     }
@@ -1615,7 +1644,7 @@ class CustomPdfParser:
                     paragraph = {
                         "content": batch[0]["block_content"],
                         "page_index": batch[0]["page_index"],
-                        "section_path": current_section_path.copy(),
+                        "section_path": self._get_section_path_from_context(current_section, current_section_path),
                         "parent_section_id": get_parent_section_id(para_chunk_id),
                         "chunk_id": para_chunk_id
                     }
@@ -1631,7 +1660,7 @@ class CustomPdfParser:
                         paragraph = {
                             "content": remaining_paragraphs[0]["block_content"],
                             "page_index": remaining_paragraphs[0]["page_index"],
-                            "section_path": current_section_path.copy(),
+                            "section_path": self._get_section_path_from_context(current_section, current_section_path),
                             "parent_section_id": get_parent_section_id(para_chunk_id),
                             "chunk_id": para_chunk_id
                         }
@@ -1774,7 +1803,7 @@ class CustomPdfParser:
         # 如果为True，说明当前text block和last_text_block之间有标题，不应该跨页合并
         just_encountered_title: bool = False
         
-        # 辅助函数：获取parent_section_id并添加调试日志
+        # 辅助函数：获取parent_section_id
         # 注意：使用xxhash方式生成id（section_path + doc_id），与section chunk的id生成方式一致
         def get_parent_section_id(para_chunk_id: str) -> str:
             """获取parent_section_id，如果存在问题则记录警告"""
@@ -1893,7 +1922,7 @@ class CustomPdfParser:
                     paragraph = {
                         "content": last_text_block.get("block_content", "").strip(),
                         "page_index": last_page_index or 1,
-                        "section_path": current_section_path.copy(),
+                        "section_path": self._get_section_path_from_context(current_section, current_section_path),
                         "parent_section_id": get_parent_section_id(para_chunk_id),
                         "chunk_id": para_chunk_id
                     }
@@ -2063,7 +2092,7 @@ class CustomPdfParser:
                         paragraph = {
                             "content": combined_content,
                             "page_index": last_page_index,  # 使用第一个段落的页码
-                            "section_path": current_section_path.copy(),
+                            "section_path": self._get_section_path_from_context(current_section, current_section_path),
                             "parent_section_id": get_parent_section_id(para_chunk_id),
                             "chunk_id": para_chunk_id
                         }
@@ -2092,7 +2121,7 @@ class CustomPdfParser:
                             paragraph = {
                                 "content": last_block_content,
                                 "page_index": last_page_index or 1,
-                                "section_path": current_section_path.copy(),
+                                "section_path": self._get_section_path_from_context(current_section, current_section_path),
                                 "parent_section_id": get_parent_section_id(para_chunk_id),
                                 "chunk_id": para_chunk_id
                             }
@@ -2155,7 +2184,7 @@ class CustomPdfParser:
                         paragraph = {
                             "content": last_text_block.get("block_content", "").strip(),
                             "page_index": last_page_index or 1,
-                            "section_path": current_section_path.copy(),
+                            "section_path": self._get_section_path_from_context(current_section, current_section_path),
                             "parent_section_id": get_parent_section_id(para_chunk_id),
                             "chunk_id": para_chunk_id
                         }
@@ -2220,7 +2249,7 @@ class CustomPdfParser:
             paragraph = {
                 "content": last_text_block.get("block_content", "").strip(),
                 "page_index": last_page_index or 1,
-                "section_path": current_section_path.copy(),
+                "section_path": self._get_section_path_from_context(current_section, current_section_path),
                 "parent_section_id": get_parent_section_id(para_chunk_id),
                 "chunk_id": para_chunk_id
             }
@@ -2264,12 +2293,6 @@ class CustomPdfParser:
             normalized_section_path = [title.strip() for title in section_path] if section_path else []
             section_path_str = " > ".join(normalized_section_path) if normalized_section_path else ""
             
-            # 调试：如果section_path存在但parent_section_id为空，记录警告
-            if section_path_str and not parent_section_id:
-                logger.warning(f"[创建段落Chunk] 警告: section_path存在但parent_section_id为空! "
-                             f"section_path={section_path_str}, chunk_id={chunk_id}, "
-                             f"paragraph_parent_section_id={paragraph.get('parent_section_id')}")
-            
             # 构建章节标题前缀（保持与原有格式兼容：[章节标题]\n段落内容）
             section_title_prefix = ""
             if section_path_str:
@@ -2297,7 +2320,8 @@ class CustomPdfParser:
             }
             
             # 调用tokenize生成content_ltks等字段（用于检索）
-            tokenize(chunk, content, False)  # 假设是中文文档
+            # 直接传入content_with_weight，这样content_ltks也会包含章节路径前缀，检索时能匹配到章节路径
+            tokenize(chunk, content_with_weight, False)  # 假设是中文文档
             
             # 为包含章节路径的文本内容添加重要关键词字段（与旧代码保持一致，section_title会触发大模型提取关键词）
             if section_path_str:
