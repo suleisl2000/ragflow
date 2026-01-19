@@ -28,10 +28,10 @@ class FulltextQueryer:
         self.tw = term_weight.Dealer()
         self.syn = synonym.Dealer()
         self.query_fields = [
-            "title_tks^10",
-            "title_sm_tks^5",
-            "important_kwd^30",
-            "important_tks^20",
+            "title_tks^20",  # 提高文档名权重（从10提升到20）
+            "title_sm_tks^10",  # 提高文档名细粒度分词权重（从5提升到10）
+            "important_kwd^30",  # 章节路径关键词（不含文档名）
+            "important_tks^20",  # 章节路径细粒度分词（不含文档名）
             "question_tks^20",
             "content_ltks^2",
             "content_sm_ltks",

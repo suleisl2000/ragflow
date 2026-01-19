@@ -2338,11 +2338,13 @@ class CustomPdfParser:
             tokenize(chunk, content_with_weight, False)  # 假设是中文文档
             
             # 为包含章节路径的文本内容添加重要关键词字段（与旧代码保持一致，section_title会触发大模型提取关键词）
-            if section_path_str:
-                content_for_keywords = section_path_str
-                logger.info(f"[段落Chunk] 开始生成关键词: section_path_str='{section_path_str}', chunk_id={chunk_id}")
+            # 注意：important_kwd和important_tks只使用章节路径（不含文档名），文档名权重通过title_tks体现
+            if normalized_section_path:
+                # 只使用章节路径（不含文档名）
+                section_path_only = " > ".join(normalized_section_path)
+                logger.info(f"[段落Chunk] 开始生成关键词: section_path_only='{section_path_only}' (不含文档名), section_path_str='{section_path_str}', chunk_id={chunk_id}")
                 chunk["important_kwd"], chunk["important_tks"] = self._generate_keywords(
-                    content_for_keywords, topn=8, context=f"paragraph_chunk section_path '{section_path_str}'"
+                    section_path_only, topn=8, context=f"paragraph_chunk section_path '{section_path_only}'"
                 )
                 logger.info(f"[段落Chunk] 关键词生成完成: chunk_id={chunk_id}, important_kwd={chunk.get('important_kwd', 'N/A')}, important_kwd类型={type(chunk.get('important_kwd'))}, important_kwd长度={len(chunk.get('important_kwd', [])) if isinstance(chunk.get('important_kwd'), list) else 'N/A'}")
             else:
@@ -2463,15 +2465,25 @@ class CustomPdfParser:
         # 直接使用_generate_keywords的返回值：第一个元素给title_tks，第二个元素给title_sm_tks
         title_tks, title_sm_tks = self._generate_keywords(doc_name, topn=5, context="title_tokens")
         
-        # 如果title_tks是列表（无LLM情况返回[tokenized_text]），取第一个元素
+        # 如果title_tks是列表，需要转换为字符串
+        # 有LLM时：返回['关键词1', '关键词2', ...]，需要用空格连接所有关键词
+        # 无LLM时：返回[tokenized_text]，取第一个元素
         if isinstance(title_tks, list):
-            title_tks = title_tks[0] if title_tks else rag_tokenizer.tokenize(doc_name)
+            if title_tks:
+                # 如果有多个关键词，用空格连接；如果只有一个，直接取第一个元素
+                title_tks = " ".join(title_tks) if len(title_tks) > 1 else title_tks[0]
+            else:
+                # 空列表，回退到直接分词
+                title_tks = rag_tokenizer.tokenize(doc_name)
         
         doc = {
             "docnm_kwd": doc_name,  # 使用文档名而不是完整文件名
             "title_tks": title_tks,  # 粗粒度分词（对应important_kwd）
             "title_sm_tks": title_sm_tks  # 细粒度分词（对应important_tks）
         }
+        
+        # 日志：输出doc_name, title_tks和title_sm_tks
+        logger.info(f"[基础文档] doc_name='{doc_name}', title_tks='{title_tks}' (类型: {type(title_tks).__name__}), title_sm_tks='{title_sm_tks[:100] if isinstance(title_sm_tks, str) and len(title_sm_tks) > 100 else title_sm_tks}' (类型: {type(title_sm_tks).__name__})")
         
         return doc
     
@@ -2610,12 +2622,13 @@ class CustomPdfParser:
         # 位置信息已在上面设置，不需要再调用add_positions
         
         # 为包含章节标题的文本内容添加重要关键词字段
-        if section_title:
-            # 构建用于关键词生成的内容（章节标题）
-            #content_for_keywords = f"{section_title}\n{text}"
-            content_for_keywords = f"{section_title}"
+        # 注意：important_kwd和important_tks只使用章节路径（不含文档名），文档名权重通过title_tks体现
+        if self.title_hierarchy:
+            # 只使用章节路径（不含文档名）
+            section_path_only = " > ".join(self.title_hierarchy)
+            logger.info(f"[文本项] 开始生成关键词: section_path_only='{section_path_only}' (不含文档名), section_title='{section_title}'")
             chunk["important_kwd"], chunk["important_tks"] = self._generate_keywords(
-                content_for_keywords, topn=8, context=f"text_content '{section_title}'"
+                section_path_only, topn=8, context=f"text_content section_path '{section_path_only}'"
             )
         
         return chunk
