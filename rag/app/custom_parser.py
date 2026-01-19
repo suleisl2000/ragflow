@@ -698,26 +698,31 @@ class CustomPdfParser:
         """
         if self.chat_mdl:
             try:
-                logger.debug(f"[关键词生成] 使用LLM生成关键词: context={context}, topn={topn}, 内容长度={len(content)}")
+                logger.info(f"[关键词生成] 使用LLM生成关键词: context={context}, topn={topn}, 内容长度={len(content)}, 内容预览={content[:100]}")
                 # 使用LLM生成关键词
                 generated_keywords = keyword_extraction(self.chat_mdl, content, topn=topn)
+                logger.info(f"[关键词生成] LLM返回原始关键词字符串: '{generated_keywords}' (类型: {type(generated_keywords)}, 长度: {len(generated_keywords) if generated_keywords else 0})")
                 if generated_keywords:
                     # 将生成的关键词按逗号分割并添加到列表中
                     keyword_list = [kw.strip() for kw in generated_keywords.split(",") if kw.strip()]
-                    important_tks = rag_tokenizer.fine_grained_tokenize(" ".join(keyword_list))
-                    logger.info(f"[关键词生成] ✓ LLM生成关键词成功: context={context}, keywords={keyword_list}")
-                    return keyword_list, important_tks
+                    logger.info(f"[关键词生成] 分割后的关键词列表: {keyword_list} (长度: {len(keyword_list)})")
+                    if keyword_list:
+                        important_tks = rag_tokenizer.fine_grained_tokenize(" ".join(keyword_list))
+                        logger.info(f"[关键词生成] ✓ LLM生成关键词成功: context={context}, keywords={keyword_list}, important_tks长度={len(important_tks) if important_tks else 0}")
+                        return keyword_list, important_tks
+                    else:
+                        logger.warning(f"[关键词生成] LLM返回的关键词分割后为空列表: context={context}, 原始字符串='{generated_keywords}'，回退到分词方法")
                 else:
                     logger.warning(f"[关键词生成] LLM返回空关键词: context={context}，回退到分词方法")
             except Exception as e:
                 logger.warning(f"[关键词生成] LLM生成关键词失败: context={context}, 错误: {e}，回退到分词方法", exc_info=True)
         else:
-            logger.debug(f"[关键词生成] LLM模型未初始化，使用分词方法: context={context}")
+            logger.info(f"[关键词生成] LLM模型未初始化，使用分词方法: context={context}, chat_mdl={self.chat_mdl}")
         
         # 回退到原来的分词方法
         tokenized_text = rag_tokenizer.tokenize(content)
         important_tks = rag_tokenizer.fine_grained_tokenize(tokenized_text)
-        logger.debug(f"[关键词生成] 使用分词方法生成关键词: context={context}, tokenized_text={tokenized_text[:50]}...")
+        logger.info(f"[关键词生成] 使用分词方法生成关键词: context={context}, tokenized_text={tokenized_text[:100]}, important_tks长度={len(important_tks) if important_tks else 0}")
         return [tokenized_text], important_tks
     
     def get_cache_stats(self) -> Dict[str, Any]:
@@ -2335,9 +2340,13 @@ class CustomPdfParser:
             # 为包含章节路径的文本内容添加重要关键词字段（与旧代码保持一致，section_title会触发大模型提取关键词）
             if section_path_str:
                 content_for_keywords = section_path_str
+                logger.info(f"[段落Chunk] 开始生成关键词: section_path_str='{section_path_str}', chunk_id={chunk_id}")
                 chunk["important_kwd"], chunk["important_tks"] = self._generate_keywords(
                     content_for_keywords, topn=8, context=f"paragraph_chunk section_path '{section_path_str}'"
                 )
+                logger.info(f"[段落Chunk] 关键词生成完成: chunk_id={chunk_id}, important_kwd={chunk.get('important_kwd', 'N/A')}, important_kwd类型={type(chunk.get('important_kwd'))}, important_kwd长度={len(chunk.get('important_kwd', [])) if isinstance(chunk.get('important_kwd'), list) else 'N/A'}")
+            else:
+                logger.info(f"[段落Chunk] section_path_str为空，跳过关键词生成: chunk_id={chunk_id}")
             
             return chunk
             
@@ -2414,68 +2423,6 @@ class CustomPdfParser:
             logger.error(f"[创建章节Chunk] 创建章节chunk失败: {str(e)}", exc_info=True)
             return None
     
-    def _create_chunk_from_section(self, filename: str, title_hierarchy: List[str], content_lines: List[str], page_id: int) -> Optional[Dict[str, Any]]:
-        """
-        从 section 创建 chunk
-        标题按照层级拼入 chunk，叶子章节为一个 chunk 块
-        """
-        if not content_lines:
-            return None
-        
-        # 过滤掉包含"参考文献"的标题层级（支持简体字和繁体字）
-        if title_hierarchy:
-            # 检查标题中是否包含"参考文献"（简体或繁体）
-            # 去掉空格后比较，支持"參 考 文 献"、"参考文献"等格式
-            for title in title_hierarchy:
-                title_no_spaces = title.replace(' ', '').replace('　', '')
-                if '参考文献' in title_no_spaces or '參考文献' in title_no_spaces:
-                    return None
-        
-        # 创建基础文档结构
-        doc = self._create_base_doc(filename)
-        chunk = doc.copy()
-        
-        # 构建 section_title（包含文档名和标题层级）
-        doc_name = re.sub(r"\.[a-zA-Z]+$", "", filename)
-        if title_hierarchy:
-            section_title = f"{doc_name} > {' > '.join(title_hierarchy)}"
-        else:
-            section_title = doc_name
-        
-        # 合并内容行
-        text_content = '\n'.join(content_lines).strip()
-        if not text_content:
-            return None
-        
-        # 构建包含章节标题的完整内容
-        if section_title:
-            content_with_weight = f"[{section_title}]\n{text_content}"
-        else:
-            content_with_weight = text_content
-        
-        # 添加位置信息（简化处理，使用默认值）
-        chunk["position_int"] = [[page_id, 0, 0, 0, 0]]
-        chunk["page_num_int"] = [page_id]
-        chunk["top_int"] = [0]
-        
-        chunk.update({
-            "content_with_weight": content_with_weight,
-            "section_title": section_title,
-            "doc_type_kwd": "text"
-        })
-        
-        # 使用RAGFlow标准分词
-        tokenize(chunk, text_content, False)  # 假设是中文文档
-        
-        # 为包含章节标题的文本内容添加重要关键词字段
-        if section_title:
-            content_for_keywords = f"{section_title}"
-            chunk["important_kwd"], chunk["important_tks"] = self._generate_keywords(
-                content_for_keywords, topn=8, context=f"text_content '{section_title}'"
-            )
-        
-        return chunk
-    
     def _process_json_item(self, item: Dict[str, Any], filename: str) -> Optional[Dict[str, Any]]:
         """
         处理JSON数据项
@@ -2513,14 +2460,18 @@ class CustomPdfParser:
         if not doc_name:
             doc_name = "Untitled Document"
         
-        # 使用_generate_keywords生成关键词，然后提取分词结果（与important_kwd、important_tks保持一致）
-        _, important_tks = self._generate_keywords(doc_name, topn=5, context="title_tokens")
+        # 直接使用_generate_keywords的返回值：第一个元素给title_tks，第二个元素给title_sm_tks
+        title_tks, title_sm_tks = self._generate_keywords(doc_name, topn=5, context="title_tokens")
+        
+        # 如果title_tks是列表（无LLM情况返回[tokenized_text]），取第一个元素
+        if isinstance(title_tks, list):
+            title_tks = title_tks[0] if title_tks else rag_tokenizer.tokenize(doc_name)
         
         doc = {
             "docnm_kwd": doc_name,  # 使用文档名而不是完整文件名
-            "title_tks": important_tks  # 使用_generate_keywords生成的分词结果
+            "title_tks": title_tks,  # 粗粒度分词（对应important_kwd）
+            "title_sm_tks": title_sm_tks  # 细粒度分词（对应important_tks）
         }
-        doc["title_sm_tks"] = rag_tokenizer.fine_grained_tokenize(doc["title_tks"])
         
         return doc
     

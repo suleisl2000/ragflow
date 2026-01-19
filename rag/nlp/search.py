@@ -27,6 +27,8 @@ from rag.nlp import rag_tokenizer, query
 import numpy as np
 from rag.utils.doc_store_conn import DocStoreConnection, MatchDenseExpr, FusionExpr, OrderByExpr
 
+logger = logging.getLogger(__name__)
+
 
 def index_name(uid): return f"ragflow_{uid}"
 
@@ -398,6 +400,10 @@ class Dealer:
             dnm = chunk.get("docnm_kwd", "")
             did = chunk.get("doc_id", "")
 
+            # 调试日志：检查important_kwd字段
+            important_kwd_from_db = chunk.get("important_kwd", [])
+            logger.info(f"[检索] chunk_id={id}, important_kwd={important_kwd_from_db}, 类型={type(important_kwd_from_db)}, 长度={len(important_kwd_from_db) if isinstance(important_kwd_from_db, list) else 'N/A'}")
+
             if len(ranks["chunks"]) >= page_size:
                 if aggs:
                     if dnm not in ranks["doc_aggs"]:
@@ -527,31 +533,6 @@ class Dealer:
                                     if "term_similarity" in section_similarity_map[section_id]:
                                         section_similarity_map[section_id]["term_similarity"] *= reward_factor
                             
-                            # ========== 同文档加权计分（叠加在同章节加权之后） ==========
-                            # 统计每个文档被召回的chunk数量
-                            doc_chunk_count = {}  # {doc_id: count}
-                            for chunk in ranks["chunks"]:
-                                doc_id = chunk.get("doc_id", "")
-                                if doc_id:
-                                    doc_chunk_count[doc_id] = doc_chunk_count.get(doc_id, 0) + 1
-                            
-                            # 应用文档级奖励系数（叠加在同章节加权之后）
-                            # 奖励公式：doc_reward_factor = 1.0 + min(doc_chunk_count - 1, 15) * 0.015
-                            # 2个chunks: 1.015, 3个: 1.030, 5个: 1.060, 10个: 1.135, 16+: 1.225
-                            for doc_id, chunk_count in doc_chunk_count.items():
-                                if chunk_count > 1:
-                                    doc_reward_factor = 1.0 + min(chunk_count - 1, 15) * 0.015
-                                    # 对该文档的所有chunks应用奖励系数（叠加）
-                                    for chunk in ranks["chunks"]:
-                                        if chunk.get("doc_id", "") == doc_id:
-                                            # 叠加在同章节加权之后
-                                            original_similarity = chunk.get("similarity", 0.0)
-                                            chunk["similarity"] = original_similarity * doc_reward_factor
-                                            if "vector_similarity" in chunk:
-                                                chunk["vector_similarity"] *= doc_reward_factor
-                                            if "term_similarity" in chunk:
-                                                chunk["term_similarity"] *= doc_reward_factor
-                            
                             # 第二遍：构建返回结果（每个 parent_section_id 只添加一次）
                             for chunk in ranks["chunks"]:
                                 parent_section_id = chunk.get("parent_section_id", "")
@@ -561,6 +542,10 @@ class Dealer:
                                         best_paragraph_chunk = section_similarity_map.get(parent_section_id, chunk)
                                         
                                         section_path_from_chunk = section_chunk.get("section_path", "")
+                                        # 使用 best_paragraph_chunk 的 important_kwd（段落chunk有值），如果没有或为空则使用 section_chunk 的
+                                        important_kwd = best_paragraph_chunk.get("important_kwd")
+                                        if not important_kwd:  # 如果是 None、[] 或空列表
+                                            important_kwd = section_chunk.get("important_kwd", [])
                                         section_chunk_dict = {
                                             "chunk_id": section_chunk.get("id", ""),
                                             "content_ltks": section_chunk.get("content_ltks", ""),
@@ -568,7 +553,7 @@ class Dealer:
                                             "doc_id": section_chunk.get("doc_id", ""),
                                             "docnm_kwd": section_chunk.get("docnm_kwd", ""),
                                             "kb_id": section_chunk.get("kb_id", ""),
-                                            "important_kwd": section_chunk.get("important_kwd", []),
+                                            "important_kwd": important_kwd,
                                             "image_id": section_chunk.get("img_id", ""),
                                             "similarity": best_paragraph_chunk.get("similarity", 0.0),
                                             "vector_similarity": best_paragraph_chunk.get("vector_similarity", 0.0),
