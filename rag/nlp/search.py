@@ -527,6 +527,31 @@ class Dealer:
                                     if "term_similarity" in section_similarity_map[section_id]:
                                         section_similarity_map[section_id]["term_similarity"] *= reward_factor
                             
+                            # ========== 同文档加权计分（叠加在同章节加权之后） ==========
+                            # 统计每个文档被召回的chunk数量
+                            doc_chunk_count = {}  # {doc_id: count}
+                            for chunk in ranks["chunks"]:
+                                doc_id = chunk.get("doc_id", "")
+                                if doc_id:
+                                    doc_chunk_count[doc_id] = doc_chunk_count.get(doc_id, 0) + 1
+                            
+                            # 应用文档级奖励系数（叠加在同章节加权之后）
+                            # 奖励公式：doc_reward_factor = 1.0 + min(doc_chunk_count - 1, 15) * 0.015
+                            # 2个chunks: 1.015, 3个: 1.030, 5个: 1.060, 10个: 1.135, 16+: 1.225
+                            for doc_id, chunk_count in doc_chunk_count.items():
+                                if chunk_count > 1:
+                                    doc_reward_factor = 1.0 + min(chunk_count - 1, 15) * 0.015
+                                    # 对该文档的所有chunks应用奖励系数（叠加）
+                                    for chunk in ranks["chunks"]:
+                                        if chunk.get("doc_id", "") == doc_id:
+                                            # 叠加在同章节加权之后
+                                            original_similarity = chunk.get("similarity", 0.0)
+                                            chunk["similarity"] = original_similarity * doc_reward_factor
+                                            if "vector_similarity" in chunk:
+                                                chunk["vector_similarity"] *= doc_reward_factor
+                                            if "term_similarity" in chunk:
+                                                chunk["term_similarity"] *= doc_reward_factor
+                            
                             # 第二遍：构建返回结果（每个 parent_section_id 只添加一次）
                             for chunk in ranks["chunks"]:
                                 parent_section_id = chunk.get("parent_section_id", "")

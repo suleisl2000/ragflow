@@ -2291,7 +2291,16 @@ class CustomPdfParser:
             
             # 构建章节路径字符串（标准化：去掉前导和尾随空格，确保与 section_id 生成时一致）
             normalized_section_path = [title.strip() for title in section_path] if section_path else []
-            section_path_str = " > ".join(normalized_section_path) if normalized_section_path else ""
+            doc_name = base_doc.get("docnm_kwd", "")
+            
+            # 构建章节路径字符串（包含文档名）
+            if normalized_section_path:
+                if doc_name:
+                    section_path_str = doc_name + " > " + " > ".join(normalized_section_path)
+                else:
+                    section_path_str = " > ".join(normalized_section_path)
+            else:
+                section_path_str = doc_name if doc_name else ""
             
             # 构建章节标题前缀（保持与原有格式兼容：[章节标题]\n段落内容）
             section_title_prefix = ""
@@ -2361,8 +2370,15 @@ class CustomPdfParser:
             if not section_id:
                 return None
             
-            # 构建章节路径字符串
-            section_path_str = " > ".join(section_path) if section_path else ""
+            # 构建章节路径字符串（包含文档名）
+            doc_name = base_doc.get("docnm_kwd", "")
+            if section_path:
+                if doc_name:
+                    section_path_str = doc_name + " > " + " > ".join(section_path)
+                else:
+                    section_path_str = " > ".join(section_path)
+            else:
+                section_path_str = doc_name if doc_name else ""
             
             # 构建 content_with_weight（格式：[章节标题]\n章节内容，与原有格式兼容）
             if section_path_str:
@@ -2497,9 +2513,12 @@ class CustomPdfParser:
         if not doc_name:
             doc_name = "Untitled Document"
         
+        # 使用_generate_keywords生成关键词，然后提取分词结果（与important_kwd、important_tks保持一致）
+        _, important_tks = self._generate_keywords(doc_name, topn=5, context="title_tokens")
+        
         doc = {
             "docnm_kwd": doc_name,  # 使用文档名而不是完整文件名
-            "title_tks": rag_tokenizer.tokenize(doc_name)
+            "title_tks": important_tks  # 使用_generate_keywords生成的分词结果
         }
         doc["title_sm_tks"] = rag_tokenizer.fine_grained_tokenize(doc["title_tks"])
         
