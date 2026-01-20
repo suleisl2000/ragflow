@@ -21,7 +21,7 @@ from pathlib import Path
 from flask_login import current_user
 from peewee import fn
 
-from api.db import KNOWLEDGEBASE_FOLDER_NAME, FileSource, FileType, ParserType
+from api.db import KNOWLEDGEBASE_FOLDER_NAME, FileSource, FileType, ParserType, TaskStatus, StatusEnum
 from api.db.db_models import DB, Document, File, File2Document, Knowledgebase
 from api.db.services import duplicate_name
 from api.db.services.common_service import CommonService
@@ -431,7 +431,41 @@ class FileService(CommonService):
         for file in file_objs:
             try:
                 DocumentService.check_doc_health(kb.tenant_id, file.filename)
-                filename = duplicate_name(DocumentService.query, name=file.filename, kb_id=kb.id)
+                
+                # ========== 方案C：智能模式 - 检查同名文档状态 ==========
+                existing_docs = DocumentService.query(
+                    name=file.filename,
+                    kb_id=kb.id,
+                    status=StatusEnum.VALID.value
+                )
+                
+                if existing_docs:
+                    existing_doc = existing_docs[0]
+                    doc_status = existing_doc.run
+                    
+                    if doc_status == TaskStatus.DONE.value:
+                        # 已完成，跳过上传
+                        logging.info(f"[文档上传] 文档 '{file.filename}' 已存在且已完成处理，跳过上传 (kb_id={kb.id}, doc_id={existing_doc.id})")
+                        continue
+                    elif doc_status == TaskStatus.RUNNING.value:
+                        # 正在处理中，跳过（避免重复处理）
+                        logging.info(f"[文档上传] 文档 '{file.filename}' 正在处理中，跳过上传 (kb_id={kb.id}, doc_id={existing_doc.id})")
+                        continue
+                    elif doc_status == TaskStatus.FAIL.value:
+                        # 处理失败，删除旧文档，允许上传新文档
+                        logging.info(f"[文档上传] 文档 '{file.filename}' 处理失败，删除旧文档并重新上传 (kb_id={kb.id}, doc_id={existing_doc.id})")
+                        DocumentService.remove_document(existing_doc, kb.tenant_id)
+                        # 删除后，使用原文件名（duplicate_name 会确保唯一性，防止并发情况）
+                        filename = duplicate_name(DocumentService.query, name=file.filename, kb_id=kb.id)
+                    else:
+                        # 其他状态（UNSTART、CANCEL等），允许上传（会被 duplicate_name 重命名）
+                        logging.info(f"[文档上传] 文档 '{file.filename}' 已存在但状态为 {doc_status}，将重命名上传 (kb_id={kb.id}, doc_id={existing_doc.id})")
+                        filename = duplicate_name(DocumentService.query, name=file.filename, kb_id=kb.id)
+                else:
+                    # 不存在同名文档，使用原文件名（如果后续需要重命名，duplicate_name 会处理）
+                    filename = duplicate_name(DocumentService.query, name=file.filename, kb_id=kb.id)
+                # ========== 方案C结束 ==========
+                
                 filetype = filename_type(filename)
                 if filetype == FileType.OTHER.value:
                     raise RuntimeError("This type of file has not been supported yet!")
