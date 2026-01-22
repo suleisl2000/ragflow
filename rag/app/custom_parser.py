@@ -1331,6 +1331,7 @@ class CustomPdfParser:
     def _extract_paragraphs_from_textin_items(self, items: List[Dict[str, Any]], filename: str, doc_id: str = "") -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         """
         从 Textin JSON 的 detail 数组中提取段落和章节
+        支持短段落合并和跨页段落合并，与 PaddleOCR 保持一致
         
         Args:
             items: detail 数组
@@ -1351,6 +1352,46 @@ class CustomPdfParser:
         current_section_paragraph_ids: List[str] = []  # 当前章节的段落 chunk IDs
         paragraph_counter = 0  # 段落计数器
         
+        # 跨页段落合并：存储上一个文本段落项
+        last_text_item: Optional[Dict[str, Any]] = None  # 上一个文本段落项 {"text": "...", "page_id": ...}
+        last_page_id: Optional[int] = None  # 上一个文本段落的页码
+        
+        # 短段落合并：暂存待合并的短段落
+        pending_short_paragraphs: List[Dict[str, Any]] = []  # 存储待合并的短段落 {"text": "...", "page_id": ...}
+        pending_short_paragraphs_page_id: Optional[int] = None
+        
+        # 标志：刚刚遇到了标题（用于判断是否应该跨页合并）
+        just_encountered_title: bool = False
+        
+        # 辅助函数：获取parent_section_id
+        def get_parent_section_id(para_chunk_id: str) -> str:
+            """获取parent_section_id，如果存在问题则记录警告"""
+            import xxhash
+            parent_section_id = None
+            if current_section:
+                # 直接使用current_section中已生成的section_id
+                parent_section_id = current_section.get("section_id", "")
+                if not parent_section_id:
+                    logger.warning(f"[Textin段落提取] 警告: current_section存在但section_id为空! "
+                                 f"filename={filename}, para_chunk_id={para_chunk_id}, "
+                                 f"section_path={current_section_path}, current_section={current_section}")
+                    section_path_str = " > ".join([title.strip() for title in current_section_path]) if current_section_path else ""
+                    if section_path_str and doc_id:
+                        parent_section_id = xxhash.xxh64((section_path_str + doc_id).encode("utf-8", "surrogatepass")).hexdigest()
+                    elif section_path_str:
+                        parent_section_id = section_path_str
+            elif current_section_path:
+                logger.warning(f"[Textin段落提取] 警告: section_path存在但current_section为None! "
+                             f"filename={filename}, para_chunk_id={para_chunk_id}, "
+                             f"section_path={current_section_path}")
+                normalized_section_path = [title.strip() for title in current_section_path]
+                section_path_str = " > ".join(normalized_section_path)
+                if section_path_str and doc_id:
+                    parent_section_id = xxhash.xxh64((section_path_str + doc_id).encode("utf-8", "surrogatepass")).hexdigest()
+                elif section_path_str:
+                    parent_section_id = section_path_str
+            return parent_section_id or ""
+        
         # 遍历 detail 数组
         for idx, item in enumerate(items):
             if not isinstance(item, dict):
@@ -1370,6 +1411,78 @@ class CustomPdfParser:
                     continue
                 
                 page_id = item.get('page_id', 1)
+                
+                # ========== 先处理待合并的短段落和上一个文本段落 ==========
+                # 如果遇到标题，先处理待合并的短段落（如果有）
+                last_item_in_pending = False
+                if last_text_item and pending_short_paragraphs:
+                    last_item_text = last_text_item.get("text", "").strip()
+                    last_item_in_pending = any(
+                        p.get("text", "").strip() == last_item_text 
+                        for p in pending_short_paragraphs
+                    )
+                
+                if pending_short_paragraphs:
+                    # 将 Textin 格式转换为 PaddleOCR 格式（用于调用 _merge_short_paragraphs_in_batches）
+                    pending_blocks = [
+                        {"block_content": p["text"], "page_index": p["page_id"]}
+                        for p in pending_short_paragraphs
+                    ]
+                    # 记录合并前的段落数量，用于计算新增的段落
+                    paragraphs_before_merge = len(paragraphs)
+                    # 使用分批合并策略处理短段落
+                    paragraph_counter = self._merge_short_paragraphs_in_batches(
+                        pending_blocks,
+                        pending_short_paragraphs_page_id,
+                        current_section_path,
+                        get_parent_section_id,
+                        filename,
+                        paragraph_counter,
+                        paragraphs,
+                        current_section,
+                        current_section_paragraph_ids
+                    )
+                    # 更新章节内容：将合并后的段落内容添加到章节内容中
+                    if current_section:
+                        merged_paragraphs = paragraphs[paragraphs_before_merge:]
+                        for para in merged_paragraphs:
+                            para_content = para.get("content", "").strip()
+                            if para_content:
+                                if current_section["content"]:
+                                    current_section["content"] += "\n" + para_content
+                                else:
+                                    current_section["content"] = para_content
+                    pending_short_paragraphs = []
+                    pending_short_paragraphs_page_id = None
+                
+                # 如果遇到标题，上一个 text 段落应该单独成段
+                # 注意：如果last_text_item已经在pending_short_paragraphs中被处理了，不应该重复处理
+                if last_text_item and not last_item_in_pending:
+                    paragraph_counter += 1
+                    para_chunk_id = f"{filename}_para_{paragraph_counter}"
+                    paragraph = {
+                        "content": last_text_item.get("text", "").strip(),
+                        "page_index": last_page_id or 1,
+                        "section_path": self._get_section_path_from_context(current_section, current_section_path),
+                        "parent_section_id": get_parent_section_id(para_chunk_id),
+                        "chunk_id": para_chunk_id
+                    }
+                    paragraphs.append(paragraph)
+                    if current_section:
+                        current_section_paragraph_ids.append(para_chunk_id)
+                        # 更新章节内容
+                        if current_section["content"]:
+                            current_section["content"] += "\n" + last_text_item.get("text", "").strip()
+                        else:
+                            current_section["content"] = last_text_item.get("text", "").strip()
+                
+                # 清空last_text_item，避免在else分支中重复处理
+                last_text_item = None
+                last_page_id = None
+                # ========== 处理结束 ==========
+                
+                # 设置标志：刚刚遇到了标题
+                just_encountered_title = True
                 
                 # 更新章节路径
                 # outline_level 从 0 开始，对应一级标题
@@ -1429,45 +1542,261 @@ class CustomPdfParser:
                 
                 page_id = item.get('page_id', 1)
                 
-                # 生成段落 chunk ID
-                paragraph_counter += 1
-                para_chunk_id = f"{filename}_para_{paragraph_counter}"
+                # 判断是否为短段落
+                is_short = self._is_short_paragraph(text)
                 
-                # 获取当前章节路径和 parent_section_id
-                section_path = current_section_path.copy() if current_section_path else []
-                parent_section_id = current_section.get("section_id", "") if current_section else ""
-                
-                # 创建段落对象
-                paragraph = {
-                    "content": text,
-                    "page_index": page_id,  # Textin 的 page_id 从 1 开始
-                    "section_path": section_path,
-                    "parent_section_id": parent_section_id,
-                    "chunk_id": para_chunk_id
-                }
-                paragraphs.append(paragraph)
-                
-                # 将段落 chunk ID 添加到当前章节的 paragraph_chunk_ids
-                if current_section:
-                    current_section_paragraph_ids.append(para_chunk_id)
-                    # 将段落内容追加到当前章节的 content（用换行符连接）
-                    if current_section["content"]:
-                        current_section["content"] += "\n" + text
+                # ========== 检查跨页合并 ==========
+                # 检查是否需要跨页拼接（只有跨页且中间没有标题时才合并）
+                # 如果just_encountered_title为True，说明中间有标题，不应该跨页合并
+                if last_text_item and last_page_id and page_id == last_page_id + 1 and not just_encountered_title:
+                    # 跨页拼接：将上一个页面的最后一个 text 和当前页面的第一个 text 合并
+                    # 这是因为 OCR 可能错误地将一个段落识别为两个段落
+                    combined_content = last_text_item.get("text", "").strip() + text
+                    
+                    # 如果last_text_item是短段落，并且已经在pending_short_paragraphs中，需要移除它
+                    # 因为跨页合并已经处理了这个短段落
+                    if pending_short_paragraphs:
+                        last_item_text = last_text_item.get("text", "").strip()
+                        pending_short_paragraphs = [
+                            p for p in pending_short_paragraphs 
+                            if p.get("text", "").strip() != last_item_text
+                        ]
+                        # 如果pending_short_paragraphs被清空，重置pending_short_paragraphs_page_id
+                        if not pending_short_paragraphs:
+                            pending_short_paragraphs_page_id = None
+                    
+                    # 如果合并后的内容仍然是短段落，且当前段落也是短段落，加入待合并列表
+                    if self.enable_short_paragraph_merge and is_short and self._is_short_paragraph(combined_content):
+                        # 清空last_text_item，将合并后的内容加入待合并列表
+                        if pending_short_paragraphs_page_id is None:
+                            pending_short_paragraphs_page_id = last_page_id
+                        pending_short_paragraphs.append({
+                            "text": combined_content,
+                            "page_id": last_page_id
+                        })
+                        last_text_item = None
+                        last_page_id = None
                     else:
-                        current_section["content"] = text
-                
-                logger.debug(f"[Textin段落提取] 发现段落: '{text[:50]}...' (page_id={page_id}, parent_section_id={parent_section_id})")
+                        # 合并后不是短段落，或者短段落合并未启用，直接创建段落
+                        paragraph_counter += 1
+                        para_chunk_id = f"{filename}_para_{paragraph_counter}"
+                        paragraph = {
+                            "content": combined_content,
+                            "page_index": last_page_id,  # 使用第一个段落的页码
+                            "section_path": self._get_section_path_from_context(current_section, current_section_path),
+                            "parent_section_id": get_parent_section_id(para_chunk_id),
+                            "chunk_id": para_chunk_id
+                        }
+                        paragraphs.append(paragraph)
+                        if current_section:
+                            current_section_paragraph_ids.append(para_chunk_id)
+                            # 更新章节内容
+                            if current_section["content"]:
+                                current_section["content"] += "\n" + combined_content
+                            else:
+                                current_section["content"] = combined_content
+                        
+                        last_text_item = None
+                        last_page_id = None
+                elif is_short and self.enable_short_paragraph_merge:
+                    # 当前段落是短段落，先处理上一个非短段落（如果有）
+                    # 注意：
+                    # 1. 如果last_text_item是短段落，并且已经在pending_short_paragraphs中，不应该重复处理
+                    # 2. 如果just_encountered_title为True，说明last_text_item已经在处理标题时被处理了，不应该重复处理
+                    if last_text_item and not just_encountered_title:
+                        last_item_text = last_text_item.get("text", "").strip()
+                        # 检查last_text_item是否已经在pending_short_paragraphs中
+                        is_in_pending = any(
+                            p.get("text", "").strip() == last_item_text 
+                            for p in pending_short_paragraphs
+                        )
+                        # 只有当last_text_item不在pending_short_paragraphs中时，才处理它
+                        if not is_in_pending:
+                            paragraph_counter += 1
+                            para_chunk_id = f"{filename}_para_{paragraph_counter}"
+                            paragraph = {
+                                "content": last_item_text,
+                                "page_index": last_page_id or 1,
+                                "section_path": self._get_section_path_from_context(current_section, current_section_path),
+                                "parent_section_id": get_parent_section_id(para_chunk_id),
+                                "chunk_id": para_chunk_id
+                            }
+                            paragraphs.append(paragraph)
+                            if current_section:
+                                current_section_paragraph_ids.append(para_chunk_id)
+                                # 更新章节内容
+                                if current_section["content"]:
+                                    current_section["content"] += "\n" + last_item_text
+                                else:
+                                    current_section["content"] = last_item_text
+                        last_text_item = None
+                        last_page_id = None
+                    
+                    # 将当前短段落加入待合并列表
+                    if pending_short_paragraphs_page_id is None:
+                        pending_short_paragraphs_page_id = page_id
+                    pending_short_paragraphs.append({
+                        "text": text,
+                        "page_id": page_id
+                    })
+                    
+                    # 保存当前 text 段落，等待下一个段落判断是否需要跨页拼接
+                    # 即使是短段落，也需要保存，以便与下一个段落进行跨页合并
+                    last_text_item = {"text": text, "page_id": page_id}
+                    last_page_id = page_id
+                else:
+                    # 当前段落不是短段落，先处理待合并的短段落（如果有）
+                    # 在处理pending_short_paragraphs之前，先检查last_text_item是否在其中
+                    last_item_in_pending = False
+                    if last_text_item and pending_short_paragraphs:
+                        last_item_text = last_text_item.get("text", "").strip()
+                        last_item_in_pending = any(
+                            p.get("text", "").strip() == last_item_text 
+                            for p in pending_short_paragraphs
+                        )
+                    
+                    if pending_short_paragraphs:
+                        # 将 Textin 格式转换为 PaddleOCR 格式（用于调用 _merge_short_paragraphs_in_batches）
+                        pending_blocks = [
+                            {"block_content": p["text"], "page_index": p["page_id"]}
+                            for p in pending_short_paragraphs
+                        ]
+                        # 记录合并前的段落数量，用于计算新增的段落
+                        paragraphs_before_merge = len(paragraphs)
+                        # 使用分批合并策略处理短段落
+                        paragraph_counter = self._merge_short_paragraphs_in_batches(
+                            pending_blocks,
+                            pending_short_paragraphs_page_id,
+                            current_section_path,
+                            get_parent_section_id,
+                            filename,
+                            paragraph_counter,
+                            paragraphs,
+                            current_section,
+                            current_section_paragraph_ids
+                        )
+                        # 更新章节内容：将合并后的段落内容添加到章节内容中
+                        if current_section:
+                            merged_paragraphs = paragraphs[paragraphs_before_merge:]
+                            for para in merged_paragraphs:
+                                para_content = para.get("content", "").strip()
+                                if para_content:
+                                    if current_section["content"]:
+                                        current_section["content"] += "\n" + para_content
+                                    else:
+                                        current_section["content"] = para_content
+                        
+                        pending_short_paragraphs = []
+                        pending_short_paragraphs_page_id = None
+                    
+                    # 处理上一个非短段落（如果有）
+                    # 注意：
+                    # 1. 如果last_text_item已经在pending_short_paragraphs中被处理了，不应该重复处理
+                    # 2. 如果just_encountered_title为True，说明last_text_item已经在处理标题时被处理了，不应该重复处理
+                    if last_text_item and not last_item_in_pending and not just_encountered_title:
+                        paragraph_counter += 1
+                        para_chunk_id = f"{filename}_para_{paragraph_counter}"
+                        paragraph = {
+                            "content": last_text_item.get("text", "").strip(),
+                            "page_index": last_page_id or 1,
+                            "section_path": self._get_section_path_from_context(current_section, current_section_path),
+                            "parent_section_id": get_parent_section_id(para_chunk_id),
+                            "chunk_id": para_chunk_id
+                        }
+                        paragraphs.append(paragraph)
+                        if current_section:
+                            current_section_paragraph_ids.append(para_chunk_id)
+                            # 更新章节内容
+                            if current_section["content"]:
+                                current_section["content"] += "\n" + last_text_item.get("text", "").strip()
+                            else:
+                                current_section["content"] = last_text_item.get("text", "").strip()
+                    
+                    # 保存当前 text 段落，等待下一个段落判断是否需要跨页拼接
+                    last_text_item = {"text": text, "page_id": page_id}
+                    last_page_id = page_id
+                    
+                    # 已经处理了text段落，不再是"刚刚遇到标题"的状态
+                    just_encountered_title = False
+                # ========== 段落处理结束 ==========
             
             # 跳过表格（sub_type == "table"）
             # TODO: 后续根据需求决定是否处理表格
             elif sub_type == 'table':
                 logger.debug(f"[Textin段落提取] 跳过第 {idx+1} 项（表格，暂不处理）")
+                # 重置标志（其他类型的block也会重置标志）
+                just_encountered_title = False
                 continue
             
             # 其他类型暂时跳过
             else:
                 logger.debug(f"[Textin段落提取] 跳过第 {idx+1} 项（不支持的类型: type={item_type}, sub_type={sub_type}）")
+                # 重置标志（其他类型的block也会重置标志）
+                just_encountered_title = False
                 continue
+        
+        # 处理最后一个未完成的段落
+        # 先处理待合并的短段落（如果有）
+        # 在处理pending_short_paragraphs之前，先检查last_text_item是否在其中
+        last_item_in_pending = False
+        if last_text_item and pending_short_paragraphs:
+            last_item_text = last_text_item.get("text", "").strip()
+            last_item_in_pending = any(
+                p.get("text", "").strip() == last_item_text 
+                for p in pending_short_paragraphs
+            )
+        
+        if pending_short_paragraphs:
+            # 将 Textin 格式转换为 PaddleOCR 格式（用于调用 _merge_short_paragraphs_in_batches）
+            pending_blocks = [
+                {"block_content": p["text"], "page_index": p["page_id"]}
+                for p in pending_short_paragraphs
+            ]
+            # 记录合并前的段落数量，用于计算新增的段落
+            paragraphs_before_merge = len(paragraphs)
+            # 使用分批合并策略处理短段落
+            paragraph_counter = self._merge_short_paragraphs_in_batches(
+                pending_blocks,
+                pending_short_paragraphs_page_id,
+                current_section_path,
+                get_parent_section_id,
+                filename,
+                paragraph_counter,
+                paragraphs,
+                current_section,
+                current_section_paragraph_ids
+            )
+            # 更新章节内容：将合并后的段落内容添加到章节内容中
+            if current_section:
+                merged_paragraphs = paragraphs[paragraphs_before_merge:]
+                for para in merged_paragraphs:
+                    para_content = para.get("content", "").strip()
+                    if para_content:
+                        if current_section["content"]:
+                            current_section["content"] += "\n" + para_content
+                        else:
+                            current_section["content"] = para_content
+        
+        # 处理最后一个非短段落（如果有）
+        # 注意：如果last_text_item已经在pending_short_paragraphs中被处理了，不应该重复处理
+        if last_text_item and not last_item_in_pending:
+            paragraph_counter += 1
+            para_chunk_id = f"{filename}_para_{paragraph_counter}"
+            paragraph = {
+                "content": last_text_item.get("text", "").strip(),
+                "page_index": last_page_id or 1,
+                "section_path": self._get_section_path_from_context(current_section, current_section_path),
+                "parent_section_id": get_parent_section_id(para_chunk_id),
+                "chunk_id": para_chunk_id
+            }
+            paragraphs.append(paragraph)
+            if current_section:
+                current_section_paragraph_ids.append(para_chunk_id)
+                # 更新章节内容
+                if current_section["content"]:
+                    current_section["content"] += "\n" + last_text_item.get("text", "").strip()
+                else:
+                    current_section["content"] = last_text_item.get("text", "").strip()
         
         # 处理最后一个章节（如果有）
         if current_section:
