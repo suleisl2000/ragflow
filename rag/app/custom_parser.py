@@ -1328,9 +1328,159 @@ class CustomPdfParser:
             logger.error(f"[PDF解析] PDF文件解析失败: {filename}, 错误: {str(e)}", exc_info=True)
             return []
     
+    def _extract_paragraphs_from_textin_items(self, items: List[Dict[str, Any]], filename: str, doc_id: str = "") -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """
+        从 Textin JSON 的 detail 数组中提取段落和章节
+        
+        Args:
+            items: detail 数组
+            filename: 文件名
+            doc_id: 文档ID，用于生成section_id和parent_section_id
+        
+        Returns:
+            (paragraphs, sections) 元组
+            - paragraphs: 段落列表，每个段落包含 content, page_index, section_path, parent_section_id 等
+            - sections: 章节列表，每个章节包含 section_id, section_path, paragraph_chunk_ids, content 等
+        """
+        paragraphs = []
+        sections = []
+        
+        # 初始化状态
+        current_section_path: List[str] = []  # 当前章节路径列表
+        current_section: Optional[Dict[str, Any]] = None  # 当前章节对象
+        current_section_paragraph_ids: List[str] = []  # 当前章节的段落 chunk IDs
+        paragraph_counter = 0  # 段落计数器
+        
+        # 遍历 detail 数组
+        for idx, item in enumerate(items):
+            if not isinstance(item, dict):
+                logger.debug(f"[Textin段落提取] 跳过第 {idx+1} 项（非字典类型）")
+                continue
+            
+            # 支持两种字段名：type 和 sub_type
+            item_type = item.get('type', '') or item.get('sub_type', '')
+            sub_type = item.get('sub_type', '')
+            outline_level = item.get('outline_level', -1)
+            
+            # 识别标题（sub_type == "text_title" 且 outline_level >= 0）
+            if sub_type == 'text_title' and outline_level >= 0:
+                title_text = item.get('text', '').strip()
+                if not title_text:
+                    logger.debug(f"[Textin段落提取] 跳过第 {idx+1} 项（标题文本为空）")
+                    continue
+                
+                page_id = item.get('page_id', 1)
+                
+                # 更新章节路径
+                # outline_level 从 0 开始，对应一级标题
+                # 如果 outline_level < len(current_section_path)，需要回退到对应层级
+                if outline_level < len(current_section_path):
+                    current_section_path = current_section_path[:outline_level]
+                
+                # 追加或替换当前层级的标题
+                if outline_level >= len(current_section_path):
+                    current_section_path.append(title_text)
+                else:
+                    # 同级标题，替换最后一个
+                    current_section_path[outline_level] = title_text
+                
+                # 标准化 section_path 用于存储（去掉前导和尾随空格）
+                normalized_section_path = [title.strip() for title in current_section_path]
+                section_path_str = " > ".join(normalized_section_path)
+                
+                # 使用xxhash方式生成section_id（section_path + doc_id），与段落chunks的parent_section_id生成方式一致
+                import xxhash
+                if section_path_str and doc_id:
+                    section_id = xxhash.xxh64((section_path_str + doc_id).encode("utf-8", "surrogatepass")).hexdigest()
+                elif section_path_str:
+                    # 如果没有doc_id，使用section_path作为临时值（理论上不应该发生）
+                    section_id = section_path_str
+                else:
+                    section_id = ""
+                
+                # 如果存在上一个章节，先保存它
+                if current_section:
+                    current_section["paragraph_chunk_ids"] = current_section_paragraph_ids.copy()
+                    sections.append(current_section)
+                
+                # 创建新章节
+                # level = outline_level + 2（与 PaddleOCR 的 level 从 2 开始保持一致）
+                level = outline_level + 2
+                
+                current_section = {
+                    "section_id": section_id,
+                    "section_path": normalized_section_path.copy(),
+                    "level": level,
+                    "page_index": page_id,  # Textin 的 page_id 从 1 开始，与 PaddleOCR 的 page_index 一致
+                    "line": page_id * 10000 + idx,  # 使用 page_id 和索引计算行号（简化处理）
+                    "paragraph_chunk_ids": [],
+                    "content": ""  # 内容会在后续段落中填充
+                }
+                current_section_paragraph_ids = []
+                
+                logger.debug(f"[Textin段落提取] 发现标题: '{title_text}' (outline_level={outline_level}, level={level}, section_id={section_id})")
+            
+            # 识别段落（sub_type == "text"）
+            elif sub_type == 'text':
+                text = item.get('text', '').strip()
+                if not text:
+                    logger.debug(f"[Textin段落提取] 跳过第 {idx+1} 项（文本内容为空）")
+                    continue
+                
+                page_id = item.get('page_id', 1)
+                
+                # 生成段落 chunk ID
+                paragraph_counter += 1
+                para_chunk_id = f"{filename}_para_{paragraph_counter}"
+                
+                # 获取当前章节路径和 parent_section_id
+                section_path = current_section_path.copy() if current_section_path else []
+                parent_section_id = current_section.get("section_id", "") if current_section else ""
+                
+                # 创建段落对象
+                paragraph = {
+                    "content": text,
+                    "page_index": page_id,  # Textin 的 page_id 从 1 开始
+                    "section_path": section_path,
+                    "parent_section_id": parent_section_id,
+                    "chunk_id": para_chunk_id
+                }
+                paragraphs.append(paragraph)
+                
+                # 将段落 chunk ID 添加到当前章节的 paragraph_chunk_ids
+                if current_section:
+                    current_section_paragraph_ids.append(para_chunk_id)
+                    # 将段落内容追加到当前章节的 content（用换行符连接）
+                    if current_section["content"]:
+                        current_section["content"] += "\n" + text
+                    else:
+                        current_section["content"] = text
+                
+                logger.debug(f"[Textin段落提取] 发现段落: '{text[:50]}...' (page_id={page_id}, parent_section_id={parent_section_id})")
+            
+            # 跳过表格（sub_type == "table"）
+            # TODO: 后续根据需求决定是否处理表格
+            elif sub_type == 'table':
+                logger.debug(f"[Textin段落提取] 跳过第 {idx+1} 项（表格，暂不处理）")
+                continue
+            
+            # 其他类型暂时跳过
+            else:
+                logger.debug(f"[Textin段落提取] 跳过第 {idx+1} 项（不支持的类型: type={item_type}, sub_type={sub_type}）")
+                continue
+        
+        # 处理最后一个章节（如果有）
+        if current_section:
+            current_section["paragraph_chunk_ids"] = current_section_paragraph_ids.copy()
+            sections.append(current_section)
+        
+        logger.info(f"[Textin段落提取] 提取完成: {len(paragraphs)} 个段落，{len(sections)} 个章节")
+        return paragraphs, sections
+    
     def _parse_json_file(self, filename: str, binary: bytes, **kwargs) -> List[Dict[str, Any]]:
         """
         解析JSON格式文件（基于Textin格式）
+        统一检索方式：生成段落级和章节级 chunks，与 PaddleOCR 保持一致
         """
         try:
             logger.info(f"[JSON解析] 开始解析JSON文件: {filename}, JSON大小: {len(binary)} bytes")
@@ -1356,25 +1506,31 @@ class CustomPdfParser:
             detail_count = len(json_data['detail'])
             logger.info(f"[JSON解析] detail数组包含 {detail_count} 个数据项")
             
-            # 处理所有数据项
+            # 提取段落和章节（统一检索方式）
+            paragraphs, sections = self._extract_paragraphs_from_textin_items(
+                json_data['detail'], filename, kwargs.get("doc_id", "")
+            )
+            logger.info(f"[JSON解析] 提取了 {len(paragraphs)} 个段落，{len(sections)} 个章节")
+            
+            # 创建基础文档结构
+            base_doc = self._create_base_doc(filename)
+            
+            # 创建 chunks
             chunks = []
-            processed_count = 0
-            skipped_count = 0
             
-            for idx, item in enumerate(json_data['detail']):
-                if not isinstance(item, dict):
-                    skipped_count += 1
-                    logger.debug(f"[JSON解析] 跳过第 {idx+1} 项（非字典类型）")
-                    continue
-                
-                chunk = self._process_json_item(item, filename)
-                if chunk:
-                    chunks.append(chunk)
-                    processed_count += 1
-                else:
-                    skipped_count += 1
+            # 创建段落级 chunks（用于检索）
+            for para in paragraphs:
+                para_chunk = self._create_paragraph_chunk(para, filename, base_doc, **kwargs)
+                if para_chunk:
+                    chunks.append(para_chunk)
             
-            logger.info(f"[JSON解析] JSON文件 {filename} 解析完成: 处理 {processed_count} 项，跳过 {skipped_count} 项，生成 {len(chunks)} 个chunks")
+            # 创建章节级 chunks（用于返回）
+            for section in sections:
+                section_chunk = self._create_section_chunk(section, filename, base_doc, **kwargs)
+                if section_chunk:
+                    chunks.append(section_chunk)
+            
+            logger.info(f"[JSON解析] JSON文件 {filename} 解析完成: 生成 {len(chunks)} 个chunks (段落: {len(paragraphs)}, 章节: {len(sections)})")
             return chunks
             
         except json.JSONDecodeError as e:
