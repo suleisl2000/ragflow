@@ -1603,6 +1603,7 @@ class CustomPdfParser:
             # 识别段落（sub_type == "text"）
             elif sub_type == 'text':
                 text = item.get('text', '').strip()
+                
                 if not text:
                     logger.debug(f"[Textin段落提取] 跳过第 {idx+1} 项（文本内容为空）")
                     # 更新last_item_type（即使跳过也要更新）
@@ -1684,11 +1685,12 @@ class CustomPdfParser:
                     
                     # 跨页拼接：将上一个页面的最后一个 text 和当前页面的第一个 text 合并
                     # 这是因为 OCR 可能错误地将一个段落识别为两个段落
-                    combined_content = last_text_item.get("text", "").strip() + text
+                    last_item_text = last_text_item.get("text", "").strip()
+                    combined_content = last_item_text + text
                     
-                    # 如果last_text_item在pending_short_paragraphs中，现在已经被移除了（通过上面的处理）
-                    # 如果不在pending_short_paragraphs中，需要从pending_short_paragraphs中移除它（如果存在）
-                    if pending_short_paragraphs and not last_item_in_pending:
+                    # ========== 修复：无论last_item_in_pending是否为True，都需要从pending_short_paragraphs中移除last_text_item ==========
+                    # 因为跨页拼接后，last_text_item已经被合并到combined_content中了，不应该再单独存在
+                    if pending_short_paragraphs:
                         pending_short_paragraphs = [
                             p for p in pending_short_paragraphs 
                             if p.get("text", "").strip() != last_item_text
@@ -1774,6 +1776,7 @@ class CustomPdfParser:
                     # 将当前短段落加入待合并列表
                     if pending_short_paragraphs_page_id is None:
                         pending_short_paragraphs_page_id = page_id
+                    
                     pending_short_paragraphs.append({
                         "text": text,
                         "page_id": page_id
@@ -1831,14 +1834,12 @@ class CustomPdfParser:
                                             current_section["content"] = merged_content
                                 
                                 # 清空pending_short_paragraphs和last_text_item
+                                # 注意：当前段落（长段落）已经和短段落合并了，不应该保存到last_text_item
+                                # 因为已经处理过了，避免在下一次处理时重复创建chunk
                                 pending_short_paragraphs = []
                                 pending_short_paragraphs_page_id = None
                                 last_text_item = None
                                 last_page_id = None
-                                
-                                # 保存当前 text 段落，等待下一个段落判断是否需要跨页拼接
-                                last_text_item = {"text": text, "page_id": page_id}
-                                last_page_id = page_id
                                 
                                 # 已经处理了text段落，不再是"刚刚遇到标题"的状态
                                 just_encountered_title = False
@@ -2778,7 +2779,8 @@ class CustomPdfParser:
                 # ========== 修复结束 ==========
                     # 跨页拼接：将上一个页面的最后一个 text 和当前页面的第一个 text 合并
                     # 这是因为 PaddleOCR 错误地将一个段落识别为两个段落
-                    combined_content = last_text_block.get("block_content", "").strip() + block_content
+                    last_block_content = last_text_block.get("block_content", "").strip()
+                    combined_content = last_block_content + block_content
                     
                     # 如果last_text_block是短段落，并且已经在pending_short_paragraphs中，需要移除它
                     # 因为跨页合并已经处理了这个短段落
