@@ -1393,6 +1393,9 @@ class CustomPdfParser:
         # 标志：刚刚遇到了标题（用于判断是否应该跨页合并）
         just_encountered_title: bool = False
         
+        # 记录上一个item的type（用于过滤image后面的"注："文本）
+        last_item_type: Optional[str] = None
+        
         # 辅助函数：获取parent_section_id
         def get_parent_section_id(para_chunk_id: str) -> str:
             """获取parent_section_id，如果存在问题则记录警告"""
@@ -1449,6 +1452,8 @@ class CustomPdfParser:
                 title_text = item.get('text', '').strip()
                 if not title_text:
                     logger.debug(f"[Textin段落提取] 跳过第 {idx+1} 项（标题文本为空）")
+                    # 更新last_item_type（即使跳过也要更新）
+                    last_item_type = item_type
                     continue
                 
                 page_id = item.get('page_id', 1)
@@ -1571,6 +1576,8 @@ class CustomPdfParser:
                     current_section = None
                     current_section_paragraph_ids = []
                     just_encountered_title = True
+                    # 更新last_item_type
+                    last_item_type = item_type
                     continue
                 
                 # 创建新章节
@@ -1589,12 +1596,24 @@ class CustomPdfParser:
                 current_section_paragraph_ids = []
                 
                 logger.debug(f"[Textin段落提取] 发现标题: '{title_text}' (outline_level={outline_level}, level={level}, section_id={section_id})")
+                
+                # 更新last_item_type
+                last_item_type = item_type
             
             # 识别段落（sub_type == "text"）
             elif sub_type == 'text':
                 text = item.get('text', '').strip()
                 if not text:
                     logger.debug(f"[Textin段落提取] 跳过第 {idx+1} 项（文本内容为空）")
+                    # 更新last_item_type（即使跳过也要更新）
+                    last_item_type = item_type
+                    continue
+                
+                # 过滤：如果上一个item是image类型，且当前文本以"注："开头，则跳过
+                if last_item_type == "image" and text.startswith("注："):
+                    logger.debug(f"[Textin段落提取] 跳过第 {idx+1} 项（image后面的\"注：\"文本，已过滤）")
+                    # 更新last_item_type（即使跳过也要更新）
+                    last_item_type = item_type
                     continue
                 
                 page_id = item.get('page_id', 1)
@@ -1785,6 +1804,9 @@ class CustomPdfParser:
                     
                     # 已经处理了text段落，不再是"刚刚遇到标题"的状态
                     just_encountered_title = False
+                    
+                    # 更新last_item_type
+                    last_item_type = item_type
                 # ========== 段落处理结束 ==========
             
             # 跳过表格（sub_type == "table"）
@@ -1793,6 +1815,8 @@ class CustomPdfParser:
                 logger.debug(f"[Textin段落提取] 跳过第 {idx+1} 项（表格，暂不处理）")
                 # 重置标志（其他类型的block也会重置标志）
                 just_encountered_title = False
+                # 更新last_item_type
+                last_item_type = item_type
                 continue
             
             # 其他类型暂时跳过
@@ -1800,6 +1824,8 @@ class CustomPdfParser:
                 logger.debug(f"[Textin段落提取] 跳过第 {idx+1} 项（不支持的类型: type={item_type}, sub_type={sub_type}）")
                 # 重置标志（其他类型的block也会重置标志）
                 just_encountered_title = False
+                # 更新last_item_type（包括image类型）
+                last_item_type = item_type
                 continue
         
         # 处理最后一个未完成的段落
