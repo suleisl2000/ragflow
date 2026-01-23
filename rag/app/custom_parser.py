@@ -560,6 +560,15 @@ class CustomPdfParser:
         
         # 短段落识别模式（如果未提供，使用内置模式）
         self.short_paragraph_patterns = self.custom_config.get("short_paragraph_patterns", None)
+        
+        # handwritten 过滤配置：只有文本长度 <= 限制时，才过滤handwritten标签的项
+        # 从环境变量读取，默认13（对应"·316·**小狗料研**"的字符数）
+        handwritten_filter_length_limit = os.environ.get("TEXTIN_HANDWRITTEN_FILTER_LENGTH_LIMIT", "13")
+        try:
+            self.handwritten_filter_length_limit = int(handwritten_filter_length_limit)
+        except (ValueError, TypeError):
+            self.handwritten_filter_length_limit = 13
+            logger.warning(f"[CustomPdfParser] 无效的TEXTIN_HANDWRITTEN_FILTER_LENGTH_LIMIT环境变量值: {handwritten_filter_length_limit}，使用默认值13")
         if self.short_paragraph_patterns is None:
             # 内置默认模式
             self.short_paragraph_patterns = [
@@ -1249,7 +1258,7 @@ class CustomPdfParser:
             if self.ocr_type == "paddleocr":
                 return self._parse_paddleocr_json_file(filename, binary, **kwargs)
             else:
-                return self._parse_json_file(filename, binary, **kwargs)
+                return self._parse_textin_json_file(filename, binary, **kwargs)
         else:
             # 对于不支持的文件类型，返回空列表
             logger.warning(f"[解析入口] Custom parser仅支持PDF和JSON文件，当前文件: {filename} (扩展名: {file_ext})")
@@ -1285,7 +1294,7 @@ class CustomPdfParser:
                         chunks = self._parse_paddleocr_json_file(filename, cached_result, **kwargs)
                     else:
                         # Textin 缓存的是 JSON
-                        chunks = self._parse_json_file(filename, cached_result, **kwargs)
+                        chunks = self._parse_textin_json_file(filename, cached_result, **kwargs)
                     
                     logger.info(f"[PDF解析] 缓存结果解析完成，生成 {len(chunks)} 个chunks")
                     return chunks
@@ -1319,7 +1328,7 @@ class CustomPdfParser:
                 chunks = self._parse_paddleocr_json_file(filename, result_binary, **kwargs)
             else:
                 # Textin 返回的是 JSON
-                chunks = self._parse_json_file(filename, result_binary, **kwargs)
+                chunks = self._parse_textin_json_file(filename, result_binary, **kwargs)
             
             logger.info(f"[PDF解析] PDF解析完成: {filename}, 生成 {len(chunks)} 个chunks")
             return chunks
@@ -1327,6 +1336,27 @@ class CustomPdfParser:
         except Exception as e:
             logger.error(f"[PDF解析] PDF文件解析失败: {filename}, 错误: {str(e)}", exc_info=True)
             return []
+    
+    def _is_reference_section(self, section_path: List[str]) -> bool:
+        """
+        检查section_path是否包含"参考文献"（支持简体字和繁体字）
+        
+        Args:
+            section_path: 章节路径列表
+        
+        Returns:
+            True表示包含参考文献，False表示不包含
+        """
+        if not section_path:
+            return False
+        
+        for title in section_path:
+            # 去掉空格后比较，支持"參 考 文 献"、"参考文献"等格式
+            title_no_spaces = title.replace(' ', '').replace('　', '')
+            if '参考文献' in title_no_spaces or '參考文献' in title_no_spaces:
+                return True
+        
+        return False
     
     def _extract_paragraphs_from_textin_items(self, items: List[Dict[str, Any]], filename: str, doc_id: str = "") -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         """
@@ -1398,6 +1428,17 @@ class CustomPdfParser:
                 logger.debug(f"[Textin段落提取] 跳过第 {idx+1} 项（非字典类型）")
                 continue
             
+            # 过滤 tags 为 "handwritten" 的项（只有当文本长度 <= 限制时才过滤）
+            item_tags = item.get('tags', [])
+            if isinstance(item_tags, list) and "handwritten" in item_tags:
+                item_text = item.get('text', '').strip()
+                text_length = len(item_text)
+                if text_length <= self.handwritten_filter_length_limit:
+                    logger.debug(f"[Textin段落提取] 跳过第 {idx+1} 项（tags包含handwritten，文本长度{text_length} <= 限制{self.handwritten_filter_length_limit}）")
+                    continue
+                else:
+                    logger.debug(f"[Textin段落提取] 保留第 {idx+1} 项（tags包含handwritten，但文本长度{text_length} > 限制{self.handwritten_filter_length_limit}）")
+            
             # 支持两种字段名：type 和 sub_type
             item_type = item.get('type', '') or item.get('sub_type', '')
             sub_type = item.get('sub_type', '')
@@ -1458,23 +1499,26 @@ class CustomPdfParser:
                 # 如果遇到标题，上一个 text 段落应该单独成段
                 # 注意：如果last_text_item已经在pending_short_paragraphs中被处理了，不应该重复处理
                 if last_text_item and not last_item_in_pending:
-                    paragraph_counter += 1
-                    para_chunk_id = f"{filename}_para_{paragraph_counter}"
-                    paragraph = {
-                        "content": last_text_item.get("text", "").strip(),
-                        "page_index": last_page_id or 1,
-                        "section_path": self._get_section_path_from_context(current_section, current_section_path),
-                        "parent_section_id": get_parent_section_id(para_chunk_id),
-                        "chunk_id": para_chunk_id
-                    }
-                    paragraphs.append(paragraph)
-                    if current_section:
-                        current_section_paragraph_ids.append(para_chunk_id)
-                        # 更新章节内容
-                        if current_section["content"]:
-                            current_section["content"] += "\n" + last_text_item.get("text", "").strip()
-                        else:
-                            current_section["content"] = last_text_item.get("text", "").strip()
+                    section_path = self._get_section_path_from_context(current_section, current_section_path)
+                    # 过滤掉包含"参考文献"的段落
+                    if not self._is_reference_section(section_path):
+                        paragraph_counter += 1
+                        para_chunk_id = f"{filename}_para_{paragraph_counter}"
+                        paragraph = {
+                            "content": last_text_item.get("text", "").strip(),
+                            "page_index": last_page_id or 1,
+                            "section_path": section_path,
+                            "parent_section_id": get_parent_section_id(para_chunk_id),
+                            "chunk_id": para_chunk_id
+                        }
+                        paragraphs.append(paragraph)
+                        if current_section:
+                            current_section_paragraph_ids.append(para_chunk_id)
+                            # 更新章节内容
+                            if current_section["content"]:
+                                current_section["content"] += "\n" + last_text_item.get("text", "").strip()
+                            else:
+                                current_section["content"] = last_text_item.get("text", "").strip()
                 
                 # 清空last_text_item，避免在else分支中重复处理
                 last_text_item = None
@@ -1513,8 +1557,21 @@ class CustomPdfParser:
                 
                 # 如果存在上一个章节，先保存它
                 if current_section:
-                    current_section["paragraph_chunk_ids"] = current_section_paragraph_ids.copy()
-                    sections.append(current_section)
+                    # 过滤掉包含"参考文献"的章节
+                    if not self._is_reference_section(normalized_section_path):
+                        current_section["paragraph_chunk_ids"] = current_section_paragraph_ids.copy()
+                        sections.append(current_section)
+                    else:
+                        # 如果是参考文献章节，清空paragraph_chunk_ids，避免后续处理
+                        current_section_paragraph_ids = []
+                
+                # 创建新章节（如果包含"参考文献"则不创建）
+                if self._is_reference_section(normalized_section_path):
+                    # 跳过参考文献章节的创建
+                    current_section = None
+                    current_section_paragraph_ids = []
+                    just_encountered_title = True
+                    continue
                 
                 # 创建新章节
                 # level = outline_level + 2（与 PaddleOCR 的 level 从 2 开始保持一致）
@@ -1578,23 +1635,26 @@ class CustomPdfParser:
                         last_page_id = None
                     else:
                         # 合并后不是短段落，或者短段落合并未启用，直接创建段落
-                        paragraph_counter += 1
-                        para_chunk_id = f"{filename}_para_{paragraph_counter}"
-                        paragraph = {
-                            "content": combined_content,
-                            "page_index": last_page_id,  # 使用第一个段落的页码
-                            "section_path": self._get_section_path_from_context(current_section, current_section_path),
-                            "parent_section_id": get_parent_section_id(para_chunk_id),
-                            "chunk_id": para_chunk_id
-                        }
-                        paragraphs.append(paragraph)
-                        if current_section:
-                            current_section_paragraph_ids.append(para_chunk_id)
-                            # 更新章节内容
-                            if current_section["content"]:
-                                current_section["content"] += "\n" + combined_content
-                            else:
-                                current_section["content"] = combined_content
+                        section_path = self._get_section_path_from_context(current_section, current_section_path)
+                        # 过滤掉包含"参考文献"的段落
+                        if not self._is_reference_section(section_path):
+                            paragraph_counter += 1
+                            para_chunk_id = f"{filename}_para_{paragraph_counter}"
+                            paragraph = {
+                                "content": combined_content,
+                                "page_index": last_page_id,  # 使用第一个段落的页码
+                                "section_path": section_path,
+                                "parent_section_id": get_parent_section_id(para_chunk_id),
+                                "chunk_id": para_chunk_id
+                            }
+                            paragraphs.append(paragraph)
+                            if current_section:
+                                current_section_paragraph_ids.append(para_chunk_id)
+                                # 更新章节内容
+                                if current_section["content"]:
+                                    current_section["content"] += "\n" + combined_content
+                                else:
+                                    current_section["content"] = combined_content
                         
                         last_text_item = None
                         last_page_id = None
@@ -1612,23 +1672,27 @@ class CustomPdfParser:
                         )
                         # 只有当last_text_item不在pending_short_paragraphs中时，才处理它
                         if not is_in_pending:
-                            paragraph_counter += 1
-                            para_chunk_id = f"{filename}_para_{paragraph_counter}"
-                            paragraph = {
-                                "content": last_item_text,
-                                "page_index": last_page_id or 1,
-                                "section_path": self._get_section_path_from_context(current_section, current_section_path),
-                                "parent_section_id": get_parent_section_id(para_chunk_id),
-                                "chunk_id": para_chunk_id
-                            }
-                            paragraphs.append(paragraph)
-                            if current_section:
-                                current_section_paragraph_ids.append(para_chunk_id)
-                                # 更新章节内容
-                                if current_section["content"]:
-                                    current_section["content"] += "\n" + last_item_text
-                                else:
-                                    current_section["content"] = last_item_text
+                            section_path = self._get_section_path_from_context(current_section, current_section_path)
+                            # 过滤掉包含"参考文献"的段落
+                            if not self._is_reference_section(section_path):
+                                paragraph_counter += 1
+                                para_chunk_id = f"{filename}_para_{paragraph_counter}"
+                                paragraph = {
+                                    "content": last_item_text,
+                                    "page_index": last_page_id or 1,
+                                    "section_path": section_path,
+                                    "parent_section_id": get_parent_section_id(para_chunk_id),
+                                    "chunk_id": para_chunk_id
+                                }
+                                paragraphs.append(paragraph)
+                                if current_section:
+                                    current_section_paragraph_ids.append(para_chunk_id)
+                                    # 更新章节内容
+                                    if current_section["content"]:
+                                        current_section["content"] += "\n" + last_item_text
+                                    else:
+                                        current_section["content"] = last_item_text
+                        # 清空last_text_item，避免重复处理
                         last_text_item = None
                         last_page_id = None
                     
@@ -1694,23 +1758,26 @@ class CustomPdfParser:
                     # 1. 如果last_text_item已经在pending_short_paragraphs中被处理了，不应该重复处理
                     # 2. 如果just_encountered_title为True，说明last_text_item已经在处理标题时被处理了，不应该重复处理
                     if last_text_item and not last_item_in_pending and not just_encountered_title:
-                        paragraph_counter += 1
-                        para_chunk_id = f"{filename}_para_{paragraph_counter}"
-                        paragraph = {
-                            "content": last_text_item.get("text", "").strip(),
-                            "page_index": last_page_id or 1,
-                            "section_path": self._get_section_path_from_context(current_section, current_section_path),
-                            "parent_section_id": get_parent_section_id(para_chunk_id),
-                            "chunk_id": para_chunk_id
-                        }
-                        paragraphs.append(paragraph)
-                        if current_section:
-                            current_section_paragraph_ids.append(para_chunk_id)
-                            # 更新章节内容
-                            if current_section["content"]:
-                                current_section["content"] += "\n" + last_text_item.get("text", "").strip()
-                            else:
-                                current_section["content"] = last_text_item.get("text", "").strip()
+                        section_path = self._get_section_path_from_context(current_section, current_section_path)
+                        # 过滤掉包含"参考文献"的段落
+                        if not self._is_reference_section(section_path):
+                            paragraph_counter += 1
+                            para_chunk_id = f"{filename}_para_{paragraph_counter}"
+                            paragraph = {
+                                "content": last_text_item.get("text", "").strip(),
+                                "page_index": last_page_id or 1,
+                                "section_path": section_path,
+                                "parent_section_id": get_parent_section_id(para_chunk_id),
+                                "chunk_id": para_chunk_id
+                            }
+                            paragraphs.append(paragraph)
+                            if current_section:
+                                current_section_paragraph_ids.append(para_chunk_id)
+                                # 更新章节内容
+                                if current_section["content"]:
+                                    current_section["content"] += "\n" + last_text_item.get("text", "").strip()
+                                else:
+                                    current_section["content"] = last_text_item.get("text", "").strip()
                     
                     # 保存当前 text 段落，等待下一个段落判断是否需要跨页拼接
                     last_text_item = {"text": text, "page_id": page_id}
@@ -1780,33 +1847,39 @@ class CustomPdfParser:
         # 处理最后一个非短段落（如果有）
         # 注意：如果last_text_item已经在pending_short_paragraphs中被处理了，不应该重复处理
         if last_text_item and not last_item_in_pending:
-            paragraph_counter += 1
-            para_chunk_id = f"{filename}_para_{paragraph_counter}"
-            paragraph = {
-                "content": last_text_item.get("text", "").strip(),
-                "page_index": last_page_id or 1,
-                "section_path": self._get_section_path_from_context(current_section, current_section_path),
-                "parent_section_id": get_parent_section_id(para_chunk_id),
-                "chunk_id": para_chunk_id
-            }
-            paragraphs.append(paragraph)
-            if current_section:
-                current_section_paragraph_ids.append(para_chunk_id)
-                # 更新章节内容
-                if current_section["content"]:
-                    current_section["content"] += "\n" + last_text_item.get("text", "").strip()
-                else:
-                    current_section["content"] = last_text_item.get("text", "").strip()
+            section_path = self._get_section_path_from_context(current_section, current_section_path)
+            # 过滤掉包含"参考文献"的段落
+            if not self._is_reference_section(section_path):
+                paragraph_counter += 1
+                para_chunk_id = f"{filename}_para_{paragraph_counter}"
+                paragraph = {
+                    "content": last_text_item.get("text", "").strip(),
+                    "page_index": last_page_id or 1,
+                    "section_path": section_path,
+                    "parent_section_id": get_parent_section_id(para_chunk_id),
+                    "chunk_id": para_chunk_id
+                }
+                paragraphs.append(paragraph)
+                if current_section:
+                    current_section_paragraph_ids.append(para_chunk_id)
+                    # 更新章节内容
+                    if current_section["content"]:
+                        current_section["content"] += "\n" + last_text_item.get("text", "").strip()
+                    else:
+                        current_section["content"] = last_text_item.get("text", "").strip()
         
         # 处理最后一个章节（如果有）
         if current_section:
-            current_section["paragraph_chunk_ids"] = current_section_paragraph_ids.copy()
-            sections.append(current_section)
+            # 过滤掉包含"参考文献"的章节
+            section_path = current_section.get("section_path", [])
+            if not self._is_reference_section(section_path):
+                current_section["paragraph_chunk_ids"] = current_section_paragraph_ids.copy()
+                sections.append(current_section)
         
         logger.info(f"[Textin段落提取] 提取完成: {len(paragraphs)} 个段落，{len(sections)} 个章节")
         return paragraphs, sections
     
-    def _parse_json_file(self, filename: str, binary: bytes, **kwargs) -> List[Dict[str, Any]]:
+    def _parse_textin_json_file(self, filename: str, binary: bytes, **kwargs) -> List[Dict[str, Any]]:
         """
         解析JSON格式文件（基于Textin格式）
         统一检索方式：生成段落级和章节级 chunks，与 PaddleOCR 保持一致
@@ -2078,18 +2151,21 @@ class CustomPdfParser:
         
         # 如果合并后不超过限制，直接合并
         if len(merged_content) <= self.max_merged_paragraph_length:
-            paragraph_counter += 1
-            para_chunk_id = f"{filename}_para_{paragraph_counter}"
-            paragraph = {
-                "content": merged_content,
-                "page_index": pending_short_paragraphs_page_index or 1,
-                "section_path": self._get_section_path_from_context(current_section, current_section_path),
-                "parent_section_id": get_parent_section_id(para_chunk_id),
-                "chunk_id": para_chunk_id
-            }
-            paragraphs.append(paragraph)
-            if current_section:
-                current_section_paragraph_ids.append(para_chunk_id)
+            section_path = self._get_section_path_from_context(current_section, current_section_path)
+            # 过滤掉包含"参考文献"的段落
+            if not self._is_reference_section(section_path):
+                paragraph_counter += 1
+                para_chunk_id = f"{filename}_para_{paragraph_counter}"
+                paragraph = {
+                    "content": merged_content,
+                    "page_index": pending_short_paragraphs_page_index or 1,
+                    "section_path": section_path,
+                    "parent_section_id": get_parent_section_id(para_chunk_id),
+                    "chunk_id": para_chunk_id
+                }
+                paragraphs.append(paragraph)
+                if current_section:
+                    current_section_paragraph_ids.append(para_chunk_id)
         else:
             # 超过长度限制，尝试分批合并
             remaining_paragraphs = pending_short_paragraphs.copy()
@@ -2113,50 +2189,53 @@ class CustomPdfParser:
                         break
                 
                 # 处理当前批次
-                if len(batch) > 1:
-                    # 多个短段落，合并创建
-                    paragraph_counter += 1
-                    para_chunk_id = f"{filename}_para_{paragraph_counter}"
-                    paragraph = {
-                        "content": batch_content,
-                        "page_index": batch_page_index if batch_page_index is not None else (batch[0]["page_index"] if batch else 1),
-                        "section_path": self._get_section_path_from_context(current_section, current_section_path),
-                        "parent_section_id": get_parent_section_id(para_chunk_id),
-                        "chunk_id": para_chunk_id
-                    }
-                    paragraphs.append(paragraph)
-                    if current_section:
-                        current_section_paragraph_ids.append(para_chunk_id)
-                elif len(batch) == 1:
-                    # 只有一个短段落，单独创建
-                    paragraph_counter += 1
-                    para_chunk_id = f"{filename}_para_{paragraph_counter}"
-                    paragraph = {
-                        "content": batch[0]["block_content"],
-                        "page_index": batch[0]["page_index"],
-                        "section_path": self._get_section_path_from_context(current_section, current_section_path),
-                        "parent_section_id": get_parent_section_id(para_chunk_id),
-                        "chunk_id": para_chunk_id
-                    }
-                    paragraphs.append(paragraph)
-                    if current_section:
-                        current_section_paragraph_ids.append(para_chunk_id)
-                else:
-                    # batch为空，说明第一个短段落就超过限制，单独处理它
-                    # 这种情况不应该发生（因为短段落应该小于阈值），但为了安全起见还是处理
-                    if remaining_paragraphs:
+                section_path = self._get_section_path_from_context(current_section, current_section_path)
+                # 过滤掉包含"参考文献"的段落
+                if not self._is_reference_section(section_path):
+                    if len(batch) > 1:
+                        # 多个短段落，合并创建
                         paragraph_counter += 1
                         para_chunk_id = f"{filename}_para_{paragraph_counter}"
                         paragraph = {
-                            "content": remaining_paragraphs[0]["block_content"],
-                            "page_index": remaining_paragraphs[0]["page_index"],
-                            "section_path": self._get_section_path_from_context(current_section, current_section_path),
+                            "content": batch_content,
+                            "page_index": batch_page_index if batch_page_index is not None else (batch[0]["page_index"] if batch else 1),
+                            "section_path": section_path,
                             "parent_section_id": get_parent_section_id(para_chunk_id),
                             "chunk_id": para_chunk_id
                         }
                         paragraphs.append(paragraph)
                         if current_section:
                             current_section_paragraph_ids.append(para_chunk_id)
+                    elif len(batch) == 1:
+                        # 只有一个短段落，单独创建
+                        paragraph_counter += 1
+                        para_chunk_id = f"{filename}_para_{paragraph_counter}"
+                        paragraph = {
+                            "content": batch[0]["block_content"],
+                            "page_index": batch[0]["page_index"],
+                            "section_path": section_path,
+                            "parent_section_id": get_parent_section_id(para_chunk_id),
+                            "chunk_id": para_chunk_id
+                        }
+                        paragraphs.append(paragraph)
+                        if current_section:
+                            current_section_paragraph_ids.append(para_chunk_id)
+                    else:
+                        # batch为空，说明第一个短段落就超过限制，单独处理它
+                        # 这种情况不应该发生（因为短段落应该小于阈值），但为了安全起见还是处理
+                        if remaining_paragraphs:
+                            paragraph_counter += 1
+                            para_chunk_id = f"{filename}_para_{paragraph_counter}"
+                            paragraph = {
+                                "content": remaining_paragraphs[0]["block_content"],
+                                "page_index": remaining_paragraphs[0]["page_index"],
+                                "section_path": section_path,
+                                "parent_section_id": get_parent_section_id(para_chunk_id),
+                                "chunk_id": para_chunk_id
+                            }
+                            paragraphs.append(paragraph)
+                            if current_section:
+                                current_section_paragraph_ids.append(para_chunk_id)
                         # 移除已处理的短段落
                         remaining_paragraphs = remaining_paragraphs[1:]
                         if remaining_paragraphs:
@@ -2407,18 +2486,21 @@ class CustomPdfParser:
                 # 如果遇到标题，上一个 text block 应该单独成段
                 # 注意：如果last_text_block已经在pending_short_paragraphs中被处理了，不应该重复处理
                 if last_text_block and not last_block_in_pending:
-                    paragraph_counter += 1
-                    para_chunk_id = f"{filename}_para_{paragraph_counter}"
-                    paragraph = {
-                        "content": last_text_block.get("block_content", "").strip(),
-                        "page_index": last_page_index or 1,
-                        "section_path": self._get_section_path_from_context(current_section, current_section_path),
-                        "parent_section_id": get_parent_section_id(para_chunk_id),
-                        "chunk_id": para_chunk_id
-                    }
-                    paragraphs.append(paragraph)
-                    if current_section:
-                        current_section_paragraph_ids.append(para_chunk_id)
+                    section_path = self._get_section_path_from_context(current_section, current_section_path)
+                    # 过滤掉包含"参考文献"的段落
+                    if not self._is_reference_section(section_path):
+                        paragraph_counter += 1
+                        para_chunk_id = f"{filename}_para_{paragraph_counter}"
+                        paragraph = {
+                            "content": last_text_block.get("block_content", "").strip(),
+                            "page_index": last_page_index or 1,
+                            "section_path": section_path,
+                            "parent_section_id": get_parent_section_id(para_chunk_id),
+                            "chunk_id": para_chunk_id
+                        }
+                        paragraphs.append(paragraph)
+                        if current_section:
+                            current_section_paragraph_ids.append(para_chunk_id)
                 
                 # ========== 修复：无论last_text_block是否被处理，都要清空，避免在else分支中重复处理 ==========
                 # 清空last_text_block，避免在else分支中重复处理
@@ -2501,8 +2583,20 @@ class CustomPdfParser:
                     
                     # 如果存在上一个章节，先保存它（不聚合内容，内容聚合在 _apply_paper_merge_strategy 中完成）
                     if current_section:
-                        current_section["paragraph_chunk_ids"] = current_section_paragraph_ids.copy()
-                        sections.append(current_section)
+                        # 过滤掉包含"参考文献"的章节
+                        if not self._is_reference_section(normalized_section_path):
+                            current_section["paragraph_chunk_ids"] = current_section_paragraph_ids.copy()
+                            sections.append(current_section)
+                        else:
+                            # 如果是参考文献章节，清空paragraph_chunk_ids，避免后续处理
+                            current_section_paragraph_ids = []
+                    
+                    # 创建新章节（如果包含"参考文献"则不创建）
+                    if self._is_reference_section(normalized_section_path):
+                        # 跳过参考文献章节的创建
+                        current_section = None
+                        current_section_paragraph_ids = []
+                        continue
                     
                     # 创建新章节
                     # 获取当前标题的行号（直接从 block 计算，不依赖 title_content_to_line）
@@ -2577,18 +2671,21 @@ class CustomPdfParser:
                         last_page_index = None
                     else:
                         # 合并后不是短段落，或者短段落合并未启用，直接创建段落
-                        paragraph_counter += 1
-                        para_chunk_id = f"{filename}_para_{paragraph_counter}"
-                        paragraph = {
-                            "content": combined_content,
-                            "page_index": last_page_index,  # 使用第一个段落的页码
-                            "section_path": self._get_section_path_from_context(current_section, current_section_path),
-                            "parent_section_id": get_parent_section_id(para_chunk_id),
-                            "chunk_id": para_chunk_id
-                        }
-                        paragraphs.append(paragraph)
-                        if current_section:
-                            current_section_paragraph_ids.append(para_chunk_id)
+                        section_path = self._get_section_path_from_context(current_section, current_section_path)
+                        # 过滤掉包含"参考文献"的段落
+                        if not self._is_reference_section(section_path):
+                            paragraph_counter += 1
+                            para_chunk_id = f"{filename}_para_{paragraph_counter}"
+                            paragraph = {
+                                "content": combined_content,
+                                "page_index": last_page_index,  # 使用第一个段落的页码
+                                "section_path": section_path,
+                                "parent_section_id": get_parent_section_id(para_chunk_id),
+                                "chunk_id": para_chunk_id
+                            }
+                            paragraphs.append(paragraph)
+                            if current_section:
+                                current_section_paragraph_ids.append(para_chunk_id)
                         
                         last_text_block = None
                         last_page_index = None
@@ -2606,18 +2703,21 @@ class CustomPdfParser:
                         )
                         # 只有当last_text_block不在pending_short_paragraphs中时，才处理它
                         if not is_in_pending:
-                            paragraph_counter += 1
-                            para_chunk_id = f"{filename}_para_{paragraph_counter}"
-                            paragraph = {
-                                "content": last_block_content,
-                                "page_index": last_page_index or 1,
-                                "section_path": self._get_section_path_from_context(current_section, current_section_path),
-                                "parent_section_id": get_parent_section_id(para_chunk_id),
-                                "chunk_id": para_chunk_id
-                            }
-                            paragraphs.append(paragraph)
-                            if current_section:
-                                current_section_paragraph_ids.append(para_chunk_id)
+                            section_path = self._get_section_path_from_context(current_section, current_section_path)
+                            # 过滤掉包含"参考文献"的段落
+                            if not self._is_reference_section(section_path):
+                                paragraph_counter += 1
+                                para_chunk_id = f"{filename}_para_{paragraph_counter}"
+                                paragraph = {
+                                    "content": last_block_content,
+                                    "page_index": last_page_index or 1,
+                                    "section_path": section_path,
+                                    "parent_section_id": get_parent_section_id(para_chunk_id),
+                                    "chunk_id": para_chunk_id
+                                }
+                                paragraphs.append(paragraph)
+                                if current_section:
+                                    current_section_paragraph_ids.append(para_chunk_id)
                         last_text_block = None
                         last_page_index = None
                     
@@ -2669,18 +2769,21 @@ class CustomPdfParser:
                     # 2. 如果just_encountered_title为True，说明last_text_block已经在处理paragraph_title时被处理了，不应该重复处理
                     if last_text_block and not last_block_in_pending and not just_encountered_title:
                     # ========== 修复结束 ==========
-                        paragraph_counter += 1
-                        para_chunk_id = f"{filename}_para_{paragraph_counter}"
-                        paragraph = {
-                            "content": last_text_block.get("block_content", "").strip(),
-                            "page_index": last_page_index or 1,
-                            "section_path": self._get_section_path_from_context(current_section, current_section_path),
-                            "parent_section_id": get_parent_section_id(para_chunk_id),
-                            "chunk_id": para_chunk_id
-                        }
-                        paragraphs.append(paragraph)
-                        if current_section:
-                            current_section_paragraph_ids.append(para_chunk_id)
+                        section_path = self._get_section_path_from_context(current_section, current_section_path)
+                        # 过滤掉包含"参考文献"的段落
+                        if not self._is_reference_section(section_path):
+                            paragraph_counter += 1
+                            para_chunk_id = f"{filename}_para_{paragraph_counter}"
+                            paragraph = {
+                                "content": last_text_block.get("block_content", "").strip(),
+                                "page_index": last_page_index or 1,
+                                "section_path": section_path,
+                                "parent_section_id": get_parent_section_id(para_chunk_id),
+                                "chunk_id": para_chunk_id
+                            }
+                            paragraphs.append(paragraph)
+                            if current_section:
+                                current_section_paragraph_ids.append(para_chunk_id)
                     
                     # 保存当前 text block，等待下一个 block 判断是否需要跨页拼接
                     last_text_block = block
@@ -2734,23 +2837,29 @@ class CustomPdfParser:
         # 处理最后一个非短段落（如果有）
         # 注意：如果last_text_block已经在pending_short_paragraphs中被处理了，不应该重复处理
         if last_text_block and not last_block_in_pending:
-            paragraph_counter += 1
-            para_chunk_id = f"{filename}_para_{paragraph_counter}"
-            paragraph = {
-                "content": last_text_block.get("block_content", "").strip(),
-                "page_index": last_page_index or 1,
-                "section_path": self._get_section_path_from_context(current_section, current_section_path),
-                "parent_section_id": get_parent_section_id(para_chunk_id),
-                "chunk_id": para_chunk_id
-            }
-            paragraphs.append(paragraph)
-            if current_section:
-                current_section_paragraph_ids.append(para_chunk_id)
+            section_path = self._get_section_path_from_context(current_section, current_section_path)
+            # 过滤掉包含"参考文献"的段落
+            if not self._is_reference_section(section_path):
+                paragraph_counter += 1
+                para_chunk_id = f"{filename}_para_{paragraph_counter}"
+                paragraph = {
+                    "content": last_text_block.get("block_content", "").strip(),
+                    "page_index": last_page_index or 1,
+                    "section_path": section_path,
+                    "parent_section_id": get_parent_section_id(para_chunk_id),
+                    "chunk_id": para_chunk_id
+                }
+                paragraphs.append(paragraph)
+                if current_section:
+                    current_section_paragraph_ids.append(para_chunk_id)
         
         # 保存最后一个章节（不聚合内容，内容聚合在 _apply_paper_merge_strategy 中完成）
         if current_section:
-            current_section["paragraph_chunk_ids"] = current_section_paragraph_ids.copy()
-            sections.append(current_section)
+            # 过滤掉包含"参考文献"的章节
+            section_path = current_section.get("section_path", [])
+            if not self._is_reference_section(section_path):
+                current_section["paragraph_chunk_ids"] = current_section_paragraph_ids.copy()
+                sections.append(current_section)
         
         return paragraphs, sections
     
@@ -2876,6 +2985,11 @@ class CustomPdfParser:
             else:
                 section_path_str = doc_name if doc_name else ""
             
+            # 过滤掉包含"参考文献"的章节
+            if self._is_reference_section(section_path):
+                logger.debug(f"[创建章节Chunk] 跳过参考文献章节: section_path={section_path_str}")
+                return None
+            
             # 构建 content_with_weight（格式：[章节标题]\n章节内容，与原有格式兼容）
             if section_path_str:
                 content_with_weight = "[" + section_path_str + "]\n" + content
@@ -2904,38 +3018,13 @@ class CustomPdfParser:
                 "doc_type_kwd": "text"  # 标记为文本类型
             }
             
+            # 调用tokenize生成content_ltks等字段（用于检索）
+            tokenize(chunk, content_with_weight, False)  # 假设是中文文档
+            
             return chunk
             
         except Exception as e:
             logger.error(f"[创建章节Chunk] 创建章节chunk失败: {str(e)}", exc_info=True)
-            return None
-    
-    def _process_json_item(self, item: Dict[str, Any], filename: str) -> Optional[Dict[str, Any]]:
-        """
-        处理JSON数据项
-        """
-        # 支持两种字段名：type 和 sub_type
-        item_type = item.get('type', '') or item.get('sub_type', '')
-        page_id = item.get('page_id', 'N/A')
-        sub_type = item.get('sub_type', 'N/A')
-        
-        logger.debug(f"[JSON项处理] 处理项: type={item_type}, sub_type={sub_type}, page_id={page_id}")
-        
-        if item_type in ['paragraph', 'text', 'text_title']:
-            chunk = self._process_paragraph_item(item, filename)
-            if chunk:
-                logger.debug(f"[JSON项处理] ✓ 段落项处理成功: page_id={page_id}, sub_type={sub_type}")
-            return chunk
-        elif item_type == 'table':
-            chunk = self._process_table_item(item, filename)
-            if chunk:
-                logger.debug(f"[JSON项处理] ✓ 表格项处理成功: page_id={page_id}")
-            return chunk
-        # elif item_type == 'image':
-        #     return self._process_image_item(item, filename)
-        else:
-            # 其他类型暂时跳过
-            logger.debug(f"[JSON项处理] ✗ 跳过未支持的类型: type={item_type}")
             return None
     
     def _create_base_doc(self, filename: str) -> Dict[str, Any]:
@@ -2971,212 +3060,6 @@ class CustomPdfParser:
         logger.info(f"[基础文档] doc_name='{doc_name}', title_tks='{title_tks}' (类型: {type(title_tks).__name__}), title_sm_tks='{title_sm_tks[:100] if isinstance(title_sm_tks, str) and len(title_sm_tks) > 100 else title_sm_tks}' (类型: {type(title_sm_tks).__name__})")
         
         return doc
-    
-    def _process_paragraph_item(self, item: Dict[str, Any], filename: str) -> Optional[Dict[str, Any]]:
-        """
-        处理段落项
-        """
-        text = item.get('text', '').strip()
-        if not text:
-            return None
-        
-        sub_type = item.get('sub_type', '')
-        outline_level = item.get('outline_level', -1)
-        
-        # 创建基础文档结构
-        doc = self._create_base_doc(filename)
-        
-        # 处理标题
-        if sub_type == 'text_title' and outline_level >= 0:
-            return self._process_title_item(item, filename, doc)
-        elif sub_type == 'text':
-            # 处理普通文本
-            return self._process_text_item(item, filename, doc)
-    
-    def _process_title_item(self, item: Dict[str, Any], filename: str, doc: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """
-        处理标题项 - 更新章节层级
-        """
-        title_text = item.get('text', '').strip()
-        if not title_text:
-            return None
-        
-        outline_level = int(item.get('outline_level', 0))
-        
-        # 更新层级结构
-        if outline_level < len(self.current_hierarchy):
-            self.current_hierarchy = self.current_hierarchy[:outline_level]
-        
-        if outline_level >= len(self.current_hierarchy):
-            self.current_hierarchy.append(title_text)
-        else:
-            self.current_hierarchy[outline_level] = title_text
-        
-        # 更新标题层级
-        self.title_hierarchy = self.current_hierarchy.copy()
-        
-        # 创建标题chunk
-        chunk = doc.copy()
-        
-        # 添加位置信息（根据Textin格式转换）
-        page_id = item.get('page_id', 1)  # Textin的page_id从1开始
-        position = item.get('position', [])  # Textin的position是8个数字（4个角点）
-        
-        # 转换为RAGFlow格式
-        if position and len(position) >= 8:
-            ragflow_position = self._convert_textin_position_to_ragflow(position, page_id)
-            chunk["position_int"] = [ragflow_position]
-            chunk["page_num_int"] = [page_id]
-            chunk["top_int"] = [ragflow_position[3]]  # top坐标（格式：[page_id, left, right, top, bottom]）
-        else:
-            # 默认位置信息（格式：[page_id, left, right, top, bottom]）
-            chunk["position_int"] = [[page_id, 0, 0, 0, 0]]
-            chunk["page_num_int"] = [page_id]
-            chunk["top_int"] = [0]
-        
-        chunk.update({
-            "doc_type_kwd": "title"  # 文档类型
-        })
-        
-        # 使用RAGFlow标准分词
-        tokenize(chunk, title_text, False)  # 假设是中文文档
-        
-        # 位置信息已在上面设置，不需要再调用add_positions
-        
-        # 为章节标题添加重要关键词字段，提高检索权重
-        #if title_text:
-        #    chunk["important_kwd"], chunk["important_tks"] = self._generate_keywords(
-        #        title_text, topn=3, context=f"title '{title_text}'"
-        #    )
-        
-        return chunk
-    
-    def _process_text_item(self, item: Dict[str, Any], filename: str, doc: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """
-        处理普通文本项
-        """
-        # 过滤掉包含"参考文献"的title_hierarchy
-        if self.title_hierarchy and any("参考文献" in title for title in self.title_hierarchy):
-            return None
-            
-        text = item.get('text', '').strip()
-        if not text:
-            return None
-        
-        # 只记录section_title，不预先拼接内容，将文件名拼入section
-        doc_name = re.sub(r"\.[a-zA-Z]+$", "", filename)  # 去除文件扩展名
-        if self.title_hierarchy:
-            section_title = f"{doc_name} > {' > '.join(self.title_hierarchy)}"
-        else:
-            section_title = doc_name
-
-        # 创建chunk，基于基础文档结构
-        chunk = doc.copy()
-        
-        # 添加位置信息（根据Textin格式转换）
-        page_id = item.get('page_id', 1)  # Textin的page_id从1开始
-        position = item.get('position', [])  # Textin的position是8个数字（4个角点）
-        
-        # 转换为RAGFlow格式
-        if position and len(position) >= 8:
-            ragflow_position = self._convert_textin_position_to_ragflow(position, page_id)
-            chunk["position_int"] = [ragflow_position]
-            chunk["page_num_int"] = [page_id]
-            chunk["top_int"] = [ragflow_position[3]]  # top坐标（格式：[page_id, left, right, top, bottom]）
-        else:
-            # 默认位置信息（格式：[page_id, left, right, top, bottom]）
-            chunk["position_int"] = [[page_id, 0, 0, 0, 0]]
-            chunk["page_num_int"] = [page_id]
-            chunk["top_int"] = [0]
-        
-        # 构建包含章节标题的完整内容
-        if section_title:
-            content_with_weight = f"[{section_title}]\n{text}"
-        else:
-            content_with_weight = text
-        
-        chunk.update({
-            "content_with_weight": content_with_weight,  # 包含章节标题的完整内容
-            "section_title": section_title,  # 记录章节标题
-            "doc_type_kwd": "text"  # 文档类型
-        })
-        
-        # 使用RAGFlow标准分词 - 使用原始文本
-        tokenize(chunk, text, False)  # 假设是中文文档
-        
-        # 位置信息已在上面设置，不需要再调用add_positions
-        
-        # 为包含章节标题的文本内容添加重要关键词字段
-        # 注意：important_kwd和important_tks只使用章节路径（不含文档名），文档名权重通过title_tks体现
-        if self.title_hierarchy:
-            # 只使用章节路径（不含文档名）
-            section_path_only = " > ".join(self.title_hierarchy)
-            logger.info(f"[文本项] 开始生成关键词: section_path_only='{section_path_only}' (不含文档名), section_title='{section_title}'")
-            chunk["important_kwd"], chunk["important_tks"] = self._generate_keywords(
-                section_path_only, topn=8, context=f"text_content section_path '{section_path_only}'"
-            )
-        
-        return chunk
-    
-    def _process_table_item(self, item: Dict[str, Any], filename: str) -> Optional[Dict[str, Any]]:
-        """
-        处理表格项
-        """
-        cells = item.get('cells', [])
-        if not isinstance(cells, list) or not cells:
-            return None
-        
-        # 构建表格内容
-        table_content = []
-        for cell in cells:
-            if isinstance(cell, dict) and 'text' in cell:
-                table_content.append(str(cell.get('text', '')))
-        
-        if not table_content:
-            return None
-        
-        # 构建表格文本
-        table_text = " | ".join(table_content)
-        
-        # 构建增强内容
-        section_title = " > ".join(self.title_hierarchy) if self.title_hierarchy else ""
-        if section_title:
-            enhanced_content = f"[{section_title}]\n[表格] {table_text}"
-        else:
-            enhanced_content = f"[表格] {table_text}"
-        
-        # 创建基础文档结构
-        doc = self._create_base_doc(filename)
-        
-        # 创建chunk，基于基础文档结构
-        chunk = doc.copy()
-        
-        # 添加位置信息（根据Textin格式转换）
-        page_id = item.get('page_id', 1)  # Textin的page_id从1开始
-        position = item.get('position', [])  # Textin的position是8个数字（4个角点）
-        
-        # 转换为RAGFlow格式
-        if position and len(position) >= 8:
-            ragflow_position = self._convert_textin_position_to_ragflow(position, page_id)
-            chunk["position_int"] = [ragflow_position]
-            chunk["page_num_int"] = [page_id]
-            chunk["top_int"] = [ragflow_position[3]]  # top坐标（格式：[page_id, left, right, top, bottom]）
-        else:
-            # 默认位置信息（格式：[page_id, left, right, top, bottom]）
-            chunk["position_int"] = [[page_id, 0, 0, 0, 0]]
-            chunk["page_num_int"] = [page_id]
-            chunk["top_int"] = [0]
-        
-        chunk.update({
-            "doc_type_kwd": "table"  # 文档类型
-        })
-        
-        # 使用RAGFlow标准分词
-        tokenize(chunk, enhanced_content, False)  # 假设是中文文档
-        
-        # 位置信息已在上面设置，不需要再调用add_positions
-        
-        return chunk
     
     def _apply_paper_merge_strategy(self, chunks: List[Dict[str, Any]], filename: str) -> List[Dict[str, Any]]:
         """
