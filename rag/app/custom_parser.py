@@ -1625,14 +1625,70 @@ class CustomPdfParser:
                 # 检查是否需要跨页拼接（只有跨页且中间没有标题时才合并）
                 # 如果just_encountered_title为True，说明中间有标题，不应该跨页合并
                 if last_text_item and last_page_id and page_id == last_page_id + 1 and not just_encountered_title:
+                    # 修复：如果last_text_item在pending_short_paragraphs中，先处理pending_short_paragraphs中的其他短段落
+                    # 这样可以保持顺序：先处理pending_short_paragraphs中的其他短段落，然后再进行跨页合并
+                    last_item_text = last_text_item.get("text", "").strip()
+                    last_item_in_pending = False
+                    other_short_paragraphs = []
+                    
+                    if pending_short_paragraphs:
+                        # 检查last_text_item是否在pending_short_paragraphs中
+                        last_item_in_pending = any(
+                            p.get("text", "").strip() == last_item_text 
+                            for p in pending_short_paragraphs
+                        )
+                        
+                        # 如果last_text_item在pending_short_paragraphs中，先处理其他短段落
+                        if last_item_in_pending:
+                            # 分离出其他短段落（不包括last_text_item）
+                            other_short_paragraphs = [
+                                p for p in pending_short_paragraphs 
+                                if p.get("text", "").strip() != last_item_text
+                            ]
+                            
+                            # 如果有其他短段落，先处理它们
+                            if other_short_paragraphs:
+                                # 将 Textin 格式转换为 PaddleOCR 格式
+                                other_blocks = [
+                                    {"block_content": p["text"], "page_index": p["page_id"]}
+                                    for p in other_short_paragraphs
+                                ]
+                                # 记录合并前的段落数量
+                                paragraphs_before_merge = len(paragraphs)
+                                # 使用分批合并策略处理其他短段落
+                                paragraph_counter = self._merge_short_paragraphs_in_batches(
+                                    other_blocks,
+                                    pending_short_paragraphs_page_id,
+                                    current_section_path,
+                                    get_parent_section_id,
+                                    filename,
+                                    paragraph_counter,
+                                    paragraphs,
+                                    current_section,
+                                    current_section_paragraph_ids
+                                )
+                                # 更新章节内容
+                                if current_section:
+                                    merged_paragraphs = paragraphs[paragraphs_before_merge:]
+                                    for para in merged_paragraphs:
+                                        para_content = para.get("content", "").strip()
+                                        if para_content:
+                                            if current_section["content"]:
+                                                current_section["content"] += "\n" + para_content
+                                            else:
+                                                current_section["content"] = para_content
+                                
+                                # 清空pending_short_paragraphs（因为其他短段落已经处理了）
+                                pending_short_paragraphs = []
+                                pending_short_paragraphs_page_id = None
+                    
                     # 跨页拼接：将上一个页面的最后一个 text 和当前页面的第一个 text 合并
                     # 这是因为 OCR 可能错误地将一个段落识别为两个段落
                     combined_content = last_text_item.get("text", "").strip() + text
                     
-                    # 如果last_text_item是短段落，并且已经在pending_short_paragraphs中，需要移除它
-                    # 因为跨页合并已经处理了这个短段落
-                    if pending_short_paragraphs:
-                        last_item_text = last_text_item.get("text", "").strip()
+                    # 如果last_text_item在pending_short_paragraphs中，现在已经被移除了（通过上面的处理）
+                    # 如果不在pending_short_paragraphs中，需要从pending_short_paragraphs中移除它（如果存在）
+                    if pending_short_paragraphs and not last_item_in_pending:
                         pending_short_paragraphs = [
                             p for p in pending_short_paragraphs 
                             if p.get("text", "").strip() != last_item_text
@@ -1737,6 +1793,59 @@ class CustomPdfParser:
                             p.get("text", "").strip() == last_item_text 
                             for p in pending_short_paragraphs
                         )
+                    
+                    # 修复：如果pending_short_paragraphs中只有一个短段落，且它们在同一页、同一section，
+                    # 尝试将短段落和长段落合并，而不是单独创建短段落chunk
+                    if pending_short_paragraphs and len(pending_short_paragraphs) == 1:
+                        short_para = pending_short_paragraphs[0]
+                        short_para_text = short_para.get("text", "").strip()
+                        short_para_page_id = short_para.get("page_id", 1)
+                        
+                        # 检查是否在同一页、同一section
+                        if short_para_page_id == page_id:
+                            # 尝试合并短段落和长段落
+                            merged_content = short_para_text + "\n" + text
+                            
+                            # 检查合并后的长度是否超过限制
+                            if len(merged_content) <= self.max_merged_paragraph_length:
+                                # 可以合并，创建合并后的段落
+                                section_path = self._get_section_path_from_context(current_section, current_section_path)
+                                # 过滤掉包含"参考文献"的段落
+                                if not self._is_reference_section(section_path):
+                                    paragraph_counter += 1
+                                    para_chunk_id = f"{filename}_para_{paragraph_counter}"
+                                    paragraph = {
+                                        "content": merged_content,
+                                        "page_index": page_id,
+                                        "section_path": section_path,
+                                        "parent_section_id": get_parent_section_id(para_chunk_id),
+                                        "chunk_id": para_chunk_id
+                                    }
+                                    paragraphs.append(paragraph)
+                                    if current_section:
+                                        current_section_paragraph_ids.append(para_chunk_id)
+                                        # 更新章节内容
+                                        if current_section["content"]:
+                                            current_section["content"] += "\n" + merged_content
+                                        else:
+                                            current_section["content"] = merged_content
+                                
+                                # 清空pending_short_paragraphs和last_text_item
+                                pending_short_paragraphs = []
+                                pending_short_paragraphs_page_id = None
+                                last_text_item = None
+                                last_page_id = None
+                                
+                                # 保存当前 text 段落，等待下一个段落判断是否需要跨页拼接
+                                last_text_item = {"text": text, "page_id": page_id}
+                                last_page_id = page_id
+                                
+                                # 已经处理了text段落，不再是"刚刚遇到标题"的状态
+                                just_encountered_title = False
+                                
+                                # 更新last_item_type
+                                last_item_type = item_type
+                                continue  # 跳过后续处理
                     
                     if pending_short_paragraphs:
                         # 将 Textin 格式转换为 PaddleOCR 格式（用于调用 _merge_short_paragraphs_in_batches）
