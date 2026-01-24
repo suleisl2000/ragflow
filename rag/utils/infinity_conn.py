@@ -552,9 +552,6 @@ class InfinityConnection(DocStoreConnection):
             # line: 标题行号，用于内部逻辑和工具脚本，插入前移除
             if "line" in d:
                 del d["line"]
-            # section_title: 旧格式字段，已统一使用section_path，插入前移除
-            if "section_title" in d:
-                del d["section_title"]
             for k, v in d.items():
                 if field_keyword(k):
                     if isinstance(v, list):
@@ -664,9 +661,6 @@ class InfinityConnection(DocStoreConnection):
             # content: 用于内部逻辑（在 _apply_new_chunk_merge_strategy 中使用），不需要插入数据库
             if "content" in d:
                 del d["content"]
-            # section_title: 旧格式字段，已统一使用section_path，插入前移除
-            if "section_title" in d:
-                del d["section_title"]
             # 移除向量字段（章节表不需要向量字段，章节级 chunks 不用于向量检索）
             vector_fields = [k for k in d.keys() if re.match(r"q_\d+_vec", k)]
             for k in vector_fields:
