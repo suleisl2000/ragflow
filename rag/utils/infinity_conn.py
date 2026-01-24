@@ -552,6 +552,9 @@ class InfinityConnection(DocStoreConnection):
             # line: 标题行号，用于内部逻辑和工具脚本，插入前移除
             if "line" in d:
                 del d["line"]
+            # section_title: 旧格式字段，已统一使用section_path，插入前移除
+            if "section_title" in d:
+                del d["section_title"]
             for k, v in d.items():
                 if field_keyword(k):
                     if isinstance(v, list):
@@ -661,6 +664,9 @@ class InfinityConnection(DocStoreConnection):
             # content: 用于内部逻辑（在 _apply_new_chunk_merge_strategy 中使用），不需要插入数据库
             if "content" in d:
                 del d["content"]
+            # section_title: 旧格式字段，已统一使用section_path，插入前移除
+            if "section_title" in d:
+                del d["section_title"]
             # 移除向量字段（章节表不需要向量字段，章节级 chunks 不用于向量检索）
             vector_fields = [k for k in d.keys() if re.match(r"q_\d+_vec", k)]
             for k in vector_fields:
@@ -848,6 +854,33 @@ class InfinityConnection(DocStoreConnection):
             return 0
         filter = equivalent_condition_to_str(condition, table_instance)
         logger.debug(f"INFINITY delete table {table_name}, filter {filter}.")
+        res = table_instance.delete(filter)
+        self.connPool.release_conn(inf_conn)
+        return res.deleted_rows
+    
+    def delete_sections(self, condition: dict, indexName: str, knowledgebaseId: str) -> int:
+        """
+        删除章节级 chunks（从章节表中删除）
+        
+        Args:
+            condition: 删除条件字典
+            indexName: 索引名称
+            knowledgebaseId: 知识库ID
+        
+        Returns:
+            删除的行数
+        """
+        inf_conn = self.connPool.get_conn()
+        db_instance = inf_conn.get_database(self.dbName)
+        table_name = f"{indexName}_{knowledgebaseId}_sections"
+        try:
+            table_instance = db_instance.get_table(table_name)
+        except Exception:
+            logger.warning(f"Skipped deleting from section table {table_name} since the table doesn't exist.")
+            self.connPool.release_conn(inf_conn)
+            return 0
+        filter = equivalent_condition_to_str(condition, table_instance)
+        logger.debug(f"INFINITY delete section table {table_name}, filter {filter}.")
         res = table_instance.delete(filter)
         self.connPool.release_conn(inf_conn)
         return res.deleted_rows

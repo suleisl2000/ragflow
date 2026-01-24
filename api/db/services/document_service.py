@@ -318,6 +318,9 @@ class DocumentService(CommonService):
                 if STORAGE_IMPL.obj_exist(doc.kb_id, doc.thumbnail):
                     STORAGE_IMPL.rm(doc.kb_id, doc.thumbnail)
             settings.docStoreConn.delete({"doc_id": doc.id}, search.index_name(tenant_id), doc.kb_id)
+            
+            # 删除章节级 chunks（从章节表中删除）
+            settings.docStoreConn.delete_sections({"doc_id": doc.id}, search.index_name(tenant_id), doc.kb_id)
 
             graph_source = settings.docStoreConn.getFields(
                 settings.docStoreConn.search(["source_id"], [], {"kb_id": doc.kb_id, "knowledge_graph_kwd": ["graph"]}, [], OrderByExpr(), 0, 1, search.index_name(tenant_id), [doc.kb_id]), ["source_id"]

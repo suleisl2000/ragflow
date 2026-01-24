@@ -402,7 +402,7 @@ class Dealer:
 
             # 调试日志：检查important_kwd字段
             important_kwd_from_db = chunk.get("important_kwd", [])
-            logger.info(f"[检索] chunk_id={id}, important_kwd={important_kwd_from_db}, 类型={type(important_kwd_from_db)}, 长度={len(important_kwd_from_db) if isinstance(important_kwd_from_db, list) else 'N/A'}")
+            logger.debug(f"[检索] chunk_id={id}, important_kwd={important_kwd_from_db}, 类型={type(important_kwd_from_db)}, 长度={len(important_kwd_from_db) if isinstance(important_kwd_from_db, list) else 'N/A'}")
 
             if len(ranks["chunks"]) >= page_size:
                 if aggs:
