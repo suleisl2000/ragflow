@@ -707,14 +707,14 @@ class CustomPdfParser:
         """
         if self.chat_mdl:
             try:
-                logger.info(f"[关键词生成] 使用LLM生成关键词: context={context}, topn={topn}, 内容长度={len(content)}, 内容预览={content[:100]}")
+                logger.debug(f"[关键词生成] 使用LLM生成关键词: context={context}, topn={topn}, 内容长度={len(content)}, 内容预览={content[:100]}")
                 # 使用LLM生成关键词
                 generated_keywords = keyword_extraction(self.chat_mdl, content, topn=topn)
-                logger.info(f"[关键词生成] LLM返回原始关键词字符串: '{generated_keywords}' (类型: {type(generated_keywords)}, 长度: {len(generated_keywords) if generated_keywords else 0})")
+                logger.debug(f"[关键词生成] LLM返回原始关键词字符串: '{generated_keywords}' (类型: {type(generated_keywords)}, 长度: {len(generated_keywords) if generated_keywords else 0})")
                 if generated_keywords:
                     # 将生成的关键词按逗号分割并添加到列表中
                     keyword_list = [kw.strip() for kw in generated_keywords.split(",") if kw.strip()]
-                    logger.info(f"[关键词生成] 分割后的关键词列表: {keyword_list} (长度: {len(keyword_list)})")
+                    logger.debug(f"[关键词生成] 分割后的关键词列表: {keyword_list} (长度: {len(keyword_list)})")
                     if keyword_list:
                         important_tks = rag_tokenizer.fine_grained_tokenize(" ".join(keyword_list))
                         logger.info(f"[关键词生成] ✓ LLM生成关键词成功: context={context}, keywords={keyword_list}, important_tks长度={len(important_tks) if important_tks else 0}")
@@ -726,12 +726,12 @@ class CustomPdfParser:
             except Exception as e:
                 logger.warning(f"[关键词生成] LLM生成关键词失败: context={context}, 错误: {e}，回退到分词方法", exc_info=True)
         else:
-            logger.info(f"[关键词生成] LLM模型未初始化，使用分词方法: context={context}, chat_mdl={self.chat_mdl}")
+            logger.debug(f"[关键词生成] LLM模型未初始化，使用分词方法: context={context}, chat_mdl={self.chat_mdl}")
         
         # 回退到原来的分词方法
         tokenized_text = rag_tokenizer.tokenize(content)
         important_tks = rag_tokenizer.fine_grained_tokenize(tokenized_text)
-        logger.info(f"[关键词生成] 使用分词方法生成关键词: context={context}, tokenized_text={tokenized_text[:100]}, important_tks长度={len(important_tks) if important_tks else 0}")
+        logger.debug(f"[关键词生成] 使用分词方法生成关键词: context={context}, tokenized_text={tokenized_text[:100]}, important_tks长度={len(important_tks) if important_tks else 0}")
         return [tokenized_text], important_tks
     
     def get_cache_stats(self) -> Dict[str, Any]:
