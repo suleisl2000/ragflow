@@ -274,6 +274,18 @@ def repair_pdf_with_ghostscript(input_bytes):
 
 
 def read_potential_broken_pdf(blob):
+    """
+    尝试修复可能损坏的 PDF 文件。
+    
+    如果设置了环境变量 SKIP_PDF_REPAIR=true，则跳过修复直接返回原始文件。
+    这在使用 OCR 缓存时很有用，因为 OCR 缓存是基于原始 PDF 的 MD5 计算的，
+    如果修复 PDF 会导致 MD5 变化，从而无法匹配缓存。
+    """
+    # 默认跳过修复（SKIP_PDF_REPAIR=true），除非显式设置为 false
+    skip_repair = os.environ.get("SKIP_PDF_REPAIR", "true").lower()
+    if skip_repair not in ("false", "0", "no"):
+        return blob
+    
     def try_open(blob):
         try:
             with pdfplumber.open(BytesIO(blob)) as pdf:
