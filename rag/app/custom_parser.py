@@ -2012,7 +2012,7 @@ class CustomPdfParser:
                 current_section["paragraph_chunk_ids"] = current_section_paragraph_ids.copy()
                 sections.append(current_section)
         
-        logger.info(f"[Textin段落提取] 提取完成: {len(paragraphs)} 个段落，{len(sections)} 个章节")
+        logger.debug(f"[Textin段落提取] 提取完成: {len(paragraphs)} 个段落，{len(sections)} 个章节")
         return paragraphs, sections
     
     def _parse_textin_json_file(self, filename: str, binary: bytes, **kwargs) -> List[Dict[str, Any]]:
@@ -2048,7 +2048,7 @@ class CustomPdfParser:
             paragraphs, sections = self._extract_paragraphs_from_textin_items(
                 json_data['detail'], filename, kwargs.get("doc_id", "")
             )
-            logger.info(f"[JSON解析] 提取了 {len(paragraphs)} 个段落，{len(sections)} 个章节")
+            logger.debug(f"[JSON解析] 提取了 {len(paragraphs)} 个段落，{len(sections)} 个章节")
             
             # 创建基础文档结构
             base_doc = self._create_base_doc(filename)
@@ -2068,7 +2068,7 @@ class CustomPdfParser:
                 if section_chunk:
                     chunks.append(section_chunk)
             
-            logger.info(f"[JSON解析] JSON文件 {filename} 解析完成: 生成 {len(chunks)} 个chunks (段落: {len(paragraphs)}, 章节: {len(sections)})")
+            logger.debug(f"[JSON解析] JSON文件 {filename} 解析完成: 生成 {len(chunks)} 个chunks (段落: {len(paragraphs)}, 章节: {len(sections)})")
             return chunks
             
         except json.JSONDecodeError as e:
@@ -2130,7 +2130,7 @@ class CustomPdfParser:
             
             # 提取标题层级和段落
             paragraphs, sections = self._extract_paragraphs_from_json_blocks(parsing_res_list, filename, kwargs.get("doc_id", ""))
-            logger.info(f"[PaddleOCR JSON解析] 提取了 {len(paragraphs)} 个段落，{len(sections)} 个章节")
+            logger.debug(f"[PaddleOCR JSON解析] 提取了 {len(paragraphs)} 个段落，{len(sections)} 个章节")
             
             # 创建基础文档结构（用于获取 docnm_kwd 等字段）
             base_doc = self._create_base_doc(filename)
@@ -2150,7 +2150,7 @@ class CustomPdfParser:
                 if section_chunk:
                     chunks.append(section_chunk)
             
-            logger.info(f"[PaddleOCR JSON解析] JSON文件 {filename} 解析完成: 生成 {len(chunks)} 个chunks (段落: {len(paragraphs)}, 章节: {len(sections)})")
+            logger.debug(f"[PaddleOCR JSON解析] JSON文件 {filename} 解析完成: 生成 {len(chunks)} 个chunks (段落: {len(paragraphs)}, 章节: {len(sections)})")
             return chunks
             
         except json.JSONDecodeError as e:
@@ -3073,13 +3073,13 @@ class CustomPdfParser:
             if normalized_section_path:
                 # 只使用章节路径（不含文档名）
                 section_path_only = " > ".join(normalized_section_path)
-                logger.info(f"[段落Chunk] 开始生成关键词: section_path_only='{section_path_only}' (不含文档名), section_path_str='{section_path_str}', chunk_id={chunk_id}")
+                logger.debug(f"[段落Chunk] 开始生成关键词: section_path_only='{section_path_only}' (不含文档名), section_path_str='{section_path_str}', chunk_id={chunk_id}")
                 chunk["important_kwd"], chunk["important_tks"] = self._generate_keywords(
                     section_path_only, topn=8, context=f"paragraph_chunk section_path '{section_path_only}'"
                 )
-                logger.info(f"[段落Chunk] 关键词生成完成: chunk_id={chunk_id}, important_kwd={chunk.get('important_kwd', 'N/A')}, important_kwd类型={type(chunk.get('important_kwd'))}, important_kwd长度={len(chunk.get('important_kwd', [])) if isinstance(chunk.get('important_kwd'), list) else 'N/A'}")
+                logger.debug(f"[段落Chunk] 关键词生成完成: chunk_id={chunk_id}, important_kwd={chunk.get('important_kwd', 'N/A')}, important_kwd类型={type(chunk.get('important_kwd'))}, important_kwd长度={len(chunk.get('important_kwd', [])) if isinstance(chunk.get('important_kwd'), list) else 'N/A'}")
             else:
-                logger.info(f"[段落Chunk] section_path_str为空，跳过关键词生成: chunk_id={chunk_id}")
+                logger.debug(f"[段落Chunk] section_path_str为空，跳过关键词生成: chunk_id={chunk_id}")
             
             return chunk
             
@@ -3205,10 +3205,10 @@ class CustomPdfParser:
         注意：所有chunks都应该有chunk_type字段（paragraph或section），不再支持旧的section_title格式
         """
         if not chunks:
-            logger.info(f"[合并策略] 没有chunks需要合并: {filename}")
+            logger.debug(f"[合并策略] 没有chunks需要合并: {filename}")
             return chunks
         
-        logger.info(f"[合并策略] 开始应用合并策略: {filename}, 原始chunks数: {len(chunks)}")
+        logger.debug(f"[合并策略] 开始应用合并策略: {filename}, 原始chunks数: {len(chunks)}")
         
         # 检查是否有段落级或章节级 chunks（新设计）
         has_new_chunk_types = any(chunk.get('chunk_type') in ('paragraph', 'section') for chunk in chunks)
@@ -3333,7 +3333,7 @@ class CustomPdfParser:
         # 注意：段落级 chunks 全部保留（用于检索），无 section_path 的段落也会被聚合到无标题章节中（用于返回）
         result_chunks = paragraph_chunks + processed_section_chunks + other_chunks
         
-        logger.info(f"[合并策略] 新设计chunks处理完成: {filename}, {len(chunks)} -> {len(result_chunks)} chunks "
+        logger.debug(f"[合并策略] 新设计chunks处理完成: {filename}, {len(chunks)} -> {len(result_chunks)} chunks "
                    f"(段落: {len(paragraph_chunks)}, 章节: {len(processed_section_chunks)}, 其他: {len(other_chunks)})")
         
         return result_chunks
@@ -3506,7 +3506,7 @@ def chunk(filename: str, binary: Optional[bytes] = None, from_page: int = 0, to_
             table_chunks = [c for c in processed_chunks if c.get("doc_type_kwd") == "table"]
             image_chunks = [c for c in processed_chunks if c.get("doc_type_kwd") == "image"]
             
-            logger.info(f"解析统计 - 标题: {len(title_chunks)}, 文本: {len(text_chunks)}, 表格: {len(table_chunks)}, 图像: {len(image_chunks)}")
+            logger.debug(f"解析统计 - 标题: {len(title_chunks)}, 文本: {len(text_chunks)}, 表格: {len(table_chunks)}, 图像: {len(image_chunks)}")
             print(f"解析统计 - 标题: {len(title_chunks)}, 文本: {len(text_chunks)}, 表格: {len(table_chunks)}, 图像: {len(image_chunks)}")
         
         # section_title 字段已统一使用 section_path，无需删除
