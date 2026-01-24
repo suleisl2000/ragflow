@@ -3200,11 +3200,9 @@ class CustomPdfParser:
     
     def _apply_paper_merge_strategy(self, chunks: List[Dict[str, Any]], filename: str) -> List[Dict[str, Any]]:
         """
-        简单的合并策略 - 基于section_title分组合并
-        理论上相同section_title的chunks应该合并在一起
+        合并策略 - 处理新设计的 chunks（段落级和章节级）
         
-        注意：对于段落级（chunk_type="paragraph"）和章节级（chunk_type="section"）chunks，
-        不进行合并，因为它们已经按照新的设计进行了处理。
+        注意：所有chunks都应该有chunk_type字段（paragraph或section），不再支持旧的section_title格式
         """
         if not chunks:
             logger.info(f"[合并策略] 没有chunks需要合并: {filename}")
@@ -3219,61 +3217,9 @@ class CustomPdfParser:
             # 处理新设计的 chunks（段落级和章节级）
             return self._apply_new_chunk_merge_strategy(chunks, filename)
         
-        # 按section_title分组（原有逻辑，用于其他类型的chunks，如 textin 的旧格式）
-        grouped_chunks = {}
-        title_chunks = []
-        table_chunks = []  # 表格chunks单独处理，不参与合并
-        
-        for chunk in chunks:
-            if chunk.get('doc_type_kwd') == 'title':
-                title_chunks.append(chunk)
-            elif chunk.get('doc_type_kwd') == 'table':
-                # 表格chunks单独处理，不参与合并
-                table_chunks.append(chunk)
-            else:
-                section_title = chunk.get('section_title', '')
-                if section_title not in grouped_chunks:
-                    grouped_chunks[section_title] = []
-                grouped_chunks[section_title].append(chunk)
-        
-        logger.info(f"[合并策略] 分组统计: 标题chunks={len(title_chunks)}, 表格chunks={len(table_chunks)}, 文本分组数={len(grouped_chunks)}")
-        
-        # 合并每个分组的chunks
-        merged_chunks = []
-        
-        # 先添加标题chunks
-        merged_chunks.extend(title_chunks)
-        logger.debug(f"[合并策略] 添加了 {len(title_chunks)} 个标题chunks")
-        
-        # 添加表格chunks（每个表格单独一个chunk，不合并）
-        merged_chunks.extend(table_chunks)
-        logger.debug(f"[合并策略] 添加了 {len(table_chunks)} 个表格chunks（不合并）")
-        
-        # 合并文本chunks
-        merged_count = 0
-        single_count = 0
-        for section_title, text_chunks in grouped_chunks.items():
-            if not text_chunks:
-                continue
-                
-            if len(text_chunks) == 1:
-                # 只有一个chunk，也需要确保content_with_weight包含标题
-                single_chunk = copy.deepcopy(text_chunks[0])
-                if section_title and not single_chunk.get('content_with_weight', '').startswith('['):
-                    # 如果content_with_weight还没有包含标题，则添加
-                    single_chunk['content_with_weight'] = f"[{section_title}]\n{single_chunk.get('content_with_weight', '')}"
-                merged_chunks.append(single_chunk)
-                single_count += 1
-            else:
-                # 多个chunks，需要合并
-                logger.debug(f"[合并策略] 合并分组 '{section_title}': {len(text_chunks)} 个chunks")
-                merged_chunk = self._create_merged_chunk(text_chunks, section_title)
-                if merged_chunk:
-                    merged_chunks.append(merged_chunk)
-                    merged_count += 1
-        
-        logger.info(f"[合并策略] 合并完成: {filename}, {len(chunks)} -> {len(merged_chunks)} chunks (合并了 {merged_count} 个分组，保留 {single_count} 个单chunk分组)")
-        return merged_chunks
+        # 如果没有新格式的chunks，直接返回（理论上不应该发生）
+        logger.warning(f"[合并策略] 警告: 没有找到新格式的chunks（chunk_type='paragraph'或'section'），直接返回原始chunks")
+        return chunks
     
     def _apply_new_chunk_merge_strategy(self, chunks: List[Dict[str, Any]], filename: str) -> List[Dict[str, Any]]:
         """
@@ -3391,59 +3337,6 @@ class CustomPdfParser:
                    f"(段落: {len(paragraph_chunks)}, 章节: {len(processed_section_chunks)}, 其他: {len(other_chunks)})")
         
         return result_chunks
-    
-    def _create_merged_chunk(self, text_chunks: List[Dict[str, Any]], section_title: str) -> Optional[Dict[str, Any]]:
-        """
-        合并相同section_title的文本chunks
-        """
-        if not text_chunks:
-            return None
-        
-        # 使用第一个chunk作为基础
-        base_chunk = copy.deepcopy(text_chunks[0])
-        
-        # 收集所有文本内容
-        text_contents = []
-        for chunk in text_chunks:
-            # 从content_with_weight中提取原始文本内容
-            content_with_weight = chunk.get('content_with_weight', '')
-            # 如果包含章节标题格式，提取原始文本
-            if content_with_weight.startswith('[') and ']\n' in content_with_weight:
-                content = content_with_weight.split(']\n', 1)[1] if ']\n' in content_with_weight else content_with_weight
-            else:
-                content = content_with_weight
-            if content.strip():
-                text_contents.append(content.strip())
-        
-        if not text_contents:
-            return None
-        
-        # 合并文本内容
-        merged_text = '\n'.join(text_contents)
-        
-        # 构建最终的content_with_weight
-        if section_title:
-            final_content = f"[{section_title}]\n{merged_text}"
-        else:
-            final_content = merged_text
-        
-        # 更新chunk内容
-        base_chunk['content_with_weight'] = final_content  # 包含标题的完整内容
-        
-        # 重新分词处理
-        try:
-            # 清除旧的分词结果
-            for key in ['content_ltks', 'content_sm_ltks']:
-                if key in base_chunk:
-                    del base_chunk[key]
-            
-            # 重新分词 - 使用最终内容
-            tokenize(base_chunk, final_content, False)
-            
-        except Exception as e:
-            logger.warning(f"Failed to retokenize merged chunk: {e}")
-        
-        return base_chunk
     
     def _merge_content_without_duplicate_titles(self, content_list: List[str]) -> str:
         """
