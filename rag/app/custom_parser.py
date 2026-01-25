@@ -1426,7 +1426,10 @@ class CustomPdfParser:
             return parent_section_id or ""
         
         # 遍历 detail 数组
+        total_items = len(items)
+        
         for idx, item in enumerate(items):
+            
             if not isinstance(item, dict):
                 logger.debug(f"[Textin段落提取] 跳过第 {idx+1} 项（非字典类型）")
                 continue
@@ -2012,7 +2015,7 @@ class CustomPdfParser:
                 current_section["paragraph_chunk_ids"] = current_section_paragraph_ids.copy()
                 sections.append(current_section)
         
-        logger.debug(f"[Textin段落提取] 提取完成: {len(paragraphs)} 个段落，{len(sections)} 个章节")
+        logger.debug(f"[Textin段落提取] 提取完成: 处理了 {total_items} 个数据项，生成 {len(paragraphs)} 个段落，{len(sections)} 个章节")
         return paragraphs, sections
     
     def _parse_textin_json_file(self, filename: str, binary: bytes, **kwargs) -> List[Dict[str, Any]]:
@@ -2307,7 +2310,18 @@ class CustomPdfParser:
             remaining_paragraphs = pending_short_paragraphs.copy()
             batch_page_index = pending_short_paragraphs_page_index
             
+            loop_count = 0
+            max_loops = len(remaining_paragraphs) * 10  # 安全上限：每个段落最多循环10次
+            
             while remaining_paragraphs:
+                loop_count += 1
+                if loop_count > max_loops:
+                    logger.error(f"[短段落合并] ⚠️ 检测到可能的死循环！循环次数: {loop_count}, 剩余段落数: {len(remaining_paragraphs)}, 强制退出")
+                    logger.error(f"[短段落合并] 剩余段落内容预览: {[p.get('block_content', '')[:50] for p in remaining_paragraphs[:3]]}")
+                    break
+                
+                old_remaining_count = len(remaining_paragraphs)
+                
                 # 尝试合并尽可能多的短段落
                 batch = []
                 batch_content = ""
@@ -2326,6 +2340,42 @@ class CustomPdfParser:
                 
                 # 处理当前批次
                 section_path = self._get_section_path_from_context(current_section, current_section_path)
+                
+                # 如果 batch 为空，需要单独处理（无论是否是参考文献）
+                if len(batch) == 0:
+                    # batch为空，说明第一个短段落就超过限制，单独处理它
+                    # 这种情况不应该发生（因为短段落应该小于阈值），但为了安全起见还是处理
+                    if remaining_paragraphs:
+                        first_para_content = remaining_paragraphs[0].get('block_content', '')
+                        first_para_length = len(first_para_content)
+                        logger.warning(f"[短段落合并] ⚠️ batch为空，第一个段落超过限制！段落长度: {first_para_length}, section_path: {section_path}")
+                        
+                        # 即使 section_path 是参考文献，也要处理并移除，否则会死循环
+                        # 但不创建段落（因为参考文献会被过滤）
+                        if not self._is_reference_section(section_path):
+                            paragraph_counter += 1
+                            para_chunk_id = f"{filename}_para_{paragraph_counter}"
+                            paragraph = {
+                                "content": first_para_content,
+                                "page_index": remaining_paragraphs[0]["page_index"],
+                                "section_path": section_path,
+                                "parent_section_id": get_parent_section_id(para_chunk_id),
+                                "chunk_id": para_chunk_id
+                            }
+                            paragraphs.append(paragraph)
+                            if current_section:
+                                current_section_paragraph_ids.append(para_chunk_id)
+                        
+                        # 移除已处理的短段落（无论是否创建了段落，都要移除，避免死循环）
+                        remaining_paragraphs = remaining_paragraphs[1:]
+                        
+                        if remaining_paragraphs:
+                            batch_page_index = remaining_paragraphs[0]["page_index"]
+                        continue
+                    else:
+                        logger.error(f"[短段落合并] ⚠️ batch为空且remaining_paragraphs也为空，异常情况！")
+                        break  # 退出循环，避免死循环
+                
                 # 过滤掉包含"参考文献"的段落
                 if not self._is_reference_section(section_path):
                     if len(batch) > 1:
@@ -2356,30 +2406,15 @@ class CustomPdfParser:
                         paragraphs.append(paragraph)
                         if current_section:
                             current_section_paragraph_ids.append(para_chunk_id)
-                    else:
-                        # batch为空，说明第一个短段落就超过限制，单独处理它
-                        # 这种情况不应该发生（因为短段落应该小于阈值），但为了安全起见还是处理
-                        if remaining_paragraphs:
-                            paragraph_counter += 1
-                            para_chunk_id = f"{filename}_para_{paragraph_counter}"
-                            paragraph = {
-                                "content": remaining_paragraphs[0]["block_content"],
-                                "page_index": remaining_paragraphs[0]["page_index"],
-                                "section_path": section_path,
-                                "parent_section_id": get_parent_section_id(para_chunk_id),
-                                "chunk_id": para_chunk_id
-                            }
-                            paragraphs.append(paragraph)
-                            if current_section:
-                                current_section_paragraph_ids.append(para_chunk_id)
-                        # 移除已处理的短段落
-                        remaining_paragraphs = remaining_paragraphs[1:]
-                        if remaining_paragraphs:
-                            batch_page_index = remaining_paragraphs[0]["page_index"]
-                        continue
                 
                 # 移除已处理的短段落
                 remaining_paragraphs = remaining_paragraphs[len(batch):]
+                
+                # 验证 remaining_paragraphs 确实减少了
+                new_remaining_count = len(remaining_paragraphs)
+                if new_remaining_count >= old_remaining_count:
+                    logger.error(f"[短段落合并] ⚠️ remaining_paragraphs 未减少！old: {old_remaining_count}, new: {new_remaining_count}, batch_size: {len(batch)}")
+                
                 # 更新批次页码（用于下一批次）
                 if batch:
                     batch_page_index = batch[-1]["page_index"]
