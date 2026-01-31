@@ -850,8 +850,14 @@ class InfinityConnection(DocStoreConnection):
         logger.debug(f"INFINITY delete table {table_name}, filter {filter}.")
         res = table_instance.delete(filter)
         self.connPool.release_conn(inf_conn)
-        return res.deleted_rows
-    
+        deleted = res.deleted_rows
+        # 按 doc 或按 kb 删主表时，顺带清空 sections 表，避免遗漏
+        if "doc_id" in condition and "id" not in condition:
+            deleted += self.delete_sections(condition, indexName, knowledgebaseId)
+        elif set(condition.keys()) == {"kb_id"}:
+            deleted += self.delete_sections(condition, indexName, knowledgebaseId)
+        return deleted
+
     def delete_sections(self, condition: dict, indexName: str, knowledgebaseId: str) -> int:
         """
         删除章节级 chunks（从章节表中删除）
