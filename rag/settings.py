@@ -61,6 +61,8 @@ except Exception:
 DOC_MAXIMUM_SIZE = int(os.environ.get("MAX_CONTENT_LENGTH", 128 * 1024 * 1024))
 DOC_BULK_SIZE = int(os.environ.get("DOC_BULK_SIZE", 4))
 EMBEDDING_BATCH_SIZE = int(os.environ.get("EMBEDDING_BATCH_SIZE", 16))
+# 检索返回粒度：paragraph=只返回段落级 chunk；section=段落检索后聚合为章节级 chunk 返回（默认）
+RETRIEVAL_CHUNK_LEVEL = (os.environ.get("RETRIEVAL_CHUNK_LEVEL", "section") or "section").strip().lower()
 SVR_QUEUE_NAME = "rag_flow_svr_queue"
 SVR_CONSUMER_GROUP_NAME = "rag_flow_svr_task_broker"
 PAGERANK_FLD = "pagerank_fea"

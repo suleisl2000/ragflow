@@ -21,7 +21,7 @@ from collections import OrderedDict
 from dataclasses import dataclass
 
 from rag.prompts.generator import relevant_chunks_with_toc
-from rag.settings import TAG_FLD, PAGERANK_FLD
+from rag.settings import TAG_FLD, PAGERANK_FLD, RETRIEVAL_CHUNK_LEVEL
 from rag.utils import rmSpace, get_float
 from rag.nlp import rag_tokenizer, query
 import numpy as np
@@ -450,9 +450,10 @@ class Dealer:
                                                                    key=lambda x: x[1]["count"] * -1)]
         ranks["chunks"] = ranks["chunks"][:page_size]
         
-        # 段落检索 → 章节聚合返回
-        # 如果检索到的是段落级 chunk（有 parent_section_id），则通过 parent_section_id 查找对应的章节级 chunk 并返回
-        if ranks["chunks"]:
+        # 段落检索 → 章节聚合返回（可由 RETRIEVAL_CHUNK_LEVEL 控制）
+        # section：检索到段落级 chunk 时，通过 parent_section_id 查找对应章节级 chunk 并返回
+        # paragraph：只返回检索到的段落级 chunk，不做章节聚合
+        if ranks["chunks"] and RETRIEVAL_CHUNK_LEVEL == "section":
             # 收集所有需要查找的 parent_section_id（去重）
             parent_section_ids = set()
             paragraph_chunk_map = {}  # {parent_section_id: [chunk_dict, ...]}
