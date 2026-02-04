@@ -18,6 +18,9 @@ import os
 import re
 import time
 from qcloud_cos import CosConfig, CosS3Client
+
+# 将 qcloud_cos SDK 的 head/get object 等 INFO 日志降为仅 DEBUG 时显示（通过设为 WARNING 屏蔽）
+logging.getLogger("qcloud_cos").setLevel(logging.WARNING)
 from qcloud_cos.cos_exception import CosClientError, CosServiceError
 from rag.utils import singleton
 from rag import settings
@@ -102,7 +105,7 @@ class RAGFlowCOS:
             
             # 只在 bucket 名称发生变化时记录（避免频繁日志）
             if normalized_bucket != actual_bucket:
-                logging.info(f"[COS] Bucket名称规范化: {actual_bucket} -> {normalized_bucket}")
+                logging.debug(f"[COS] Bucket名称规范化: {actual_bucket} -> {normalized_bucket}")
             
             return method(self, normalized_bucket, *args, **kwargs)
         return wrapper
@@ -214,7 +217,7 @@ class RAGFlowCOS:
                 
                 # 执行put_object（bucket已经通过装饰器规范化）
                 self.conn.put_object(Bucket=bucket, Body=binary, Key=fnm)
-                logging.info(f"[COS] put object成功: bucket={bucket}, key={fnm}, size={len(binary)} bytes")
+                logging.debug(f"[COS] put object成功: bucket={bucket}, key={fnm}, size={len(binary)} bytes")
                 return True
             except CosServiceError as e:
                 error_code = e.get_error_code()
