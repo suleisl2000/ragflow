@@ -15,8 +15,9 @@
 #
 import json
 import logging
-import re
 import math
+import os
+import re
 from collections import OrderedDict
 from dataclasses import dataclass
 
@@ -117,6 +118,9 @@ class Dealer:
 
                 fusionExpr = FusionExpr("weighted_sum", topk, {"weights": "0.05,0.95"})
                 matchExprs = [matchText, matchDense, fusionExpr]
+                # RAGFLOW_ORDER_BY_FUSION_SCORE=1 时，第一轮按融合分降序，保证返回的「前 limit 条」为 fusion top；默认不排序
+                if os.environ.get("RAGFLOW_ORDER_BY_FUSION_SCORE") == "1":
+                    orderBy.desc("_score")
 
                 res = self.dataStore.search(src, highlightFields, filters, matchExprs, orderBy, offset, limit,
                                             idx_names, kb_ids, rank_feature=rank_feature)
