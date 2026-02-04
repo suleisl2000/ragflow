@@ -7,7 +7,7 @@ license-files = ["LICENSE"]
 readme = "README.md"
 requires-python = ">=3.10,<3.13"
 dependencies = [
-    "datrie==0.8.2",
+    "datrie==0.8.3",
     "akshare>=1.15.78,<2.0.0",
     "azure-storage-blob==12.22.0",
     "azure-identity==1.17.1",
@@ -84,7 +84,7 @@ dependencies = [
     "ranx==0.3.20",
     "readability-lxml==0.8.1",
     "valkey==6.0.2",
-    "requests==2.32.2",
+    "requests==2.32.3",
     "replicate==0.31.0",
     "roman-numbers==1.0.2",
     "ruamel-base==1.0.0",
@@ -93,7 +93,7 @@ dependencies = [
     "scikit-learn==1.5.0",
     "selenium==4.22.0",
     "selenium-wire==5.1.0",
-    "setuptools>=75.2.0,<76.0.0",
+    "setuptools>=78.1.1,<81.0.0",
     "shapely==2.0.5",
     "six==1.16.0",
     "strenum==0.4.15",
