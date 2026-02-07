@@ -157,6 +157,34 @@ class RAGFlowCOS:
             # 异常情况返回False，不记录日志
             return False
 
+    @use_default_bucket
+    def remove_bucket(self, bucket):
+        """清空并删除 bucket。文档要求删除的必须是空存储桶，故先列出并删除桶内所有对象再 delete_bucket。"""
+        try:
+            if not self.bucket_exists(bucket):
+                return
+            marker = None
+            while True:
+                kwargs = {'Bucket': bucket, 'MaxKeys': 1000}
+                if marker:
+                    kwargs['Marker'] = marker
+                resp = self.conn.list_objects(**kwargs)
+                contents = resp.get('Contents') or []
+                for obj in contents:
+                    self.conn.delete_object(Bucket=bucket, Key=obj['Key'])
+                if not resp.get('IsTruncated'):
+                    break
+                marker = resp.get('NextMarker') or (contents[-1]['Key'] if contents else None)
+                if not marker:
+                    break
+            self.conn.delete_bucket(Bucket=bucket)
+            logging.info(f"[COS] 已删除 bucket: {bucket}")
+        except CosServiceError as e:
+            if e.get_error_code() not in ['NoSuchBucket', 'NoSuchResource']:
+                logging.exception(f"[COS] Fail to remove bucket {bucket}")
+        except Exception:
+            logging.exception(f"[COS] Fail to remove bucket {bucket}")
+
     def health(self, bucket=None):
         """
         健康检查：直接返回 True（不进行实际检查）
