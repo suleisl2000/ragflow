@@ -286,11 +286,13 @@ class InfinityConnection(DocStoreConnection):
 
     def deleteIdx(self, indexName: str, knowledgebaseId: str):
         table_name = f"{indexName}_{knowledgebaseId}"
+        sections_table_name = f"{table_name}_sections"
         inf_conn = self.connPool.get_conn()
         db_instance = inf_conn.get_database(self.dbName)
         db_instance.drop_table(table_name, ConflictType.Ignore)
+        db_instance.drop_table(sections_table_name, ConflictType.Ignore)
         self.connPool.release_conn(inf_conn)
-        logger.info(f"INFINITY dropped table {table_name}")
+        logger.info(f"INFINITY dropped table {table_name} and {sections_table_name}")
 
     def indexExist(self, indexName: str, knowledgebaseId: str) -> bool:
         table_name = f"{indexName}_{knowledgebaseId}"
