@@ -3381,6 +3381,20 @@
                     "tags": "LLM,CHAT,32k",
                     "max_tokens": 32768,
                     "model_type": "chat"
+                },
+                {
+                    "llm_name": "qwen/qwen3.5-122b-a10b",
+                    "tags": "LLM,CHAT,IMAGE2TEXT,128k",
+                    "max_tokens": 128000,
+                    "model_type": "image2text",
+                    "is_tools": true
+                },
+                {
+                    "llm_name": "qwen/qwen3-vl-235b-a22b-instruct",
+                    "tags": "LLM,CHAT,IMAGE2TEXT,128k",
+                    "max_tokens": 128000,
+                    "model_type": "image2text",
+                    "is_tools": true
                 }
             ]
         },
