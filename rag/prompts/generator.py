@@ -38,7 +38,13 @@ def get_value(d, k1, k2):
 
 
 def chunks_format(reference):
-
+    """reference 可为 list（chunk 列表）或 dict（含 "chunks" 键）。"""
+    if reference is None:
+        chunks = []
+    elif isinstance(reference, list):
+        chunks = reference
+    else:
+        chunks = reference.get("chunks", [])
     return [
         {
             "id": get_value(chunk, "chunk_id", "id"),
@@ -54,7 +60,7 @@ def chunks_format(reference):
             "term_similarity": chunk.get("term_similarity"),
             "doc_type": chunk.get("doc_type_kwd"),
         }
-        for chunk in reference.get("chunks", [])
+        for chunk in chunks
     ]
 
 

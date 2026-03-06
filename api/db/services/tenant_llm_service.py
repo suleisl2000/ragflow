@@ -254,8 +254,13 @@ class LLM4Tenant:
         self.llm_type = llm_type
         self.llm_name = llm_name
         self.mdl = TenantLLMService.model_instance(tenant_id, llm_type, llm_name, lang=lang, **kwargs)
+        # 当模型在 llm 表登记为 image2text 但 CvModel 无该工厂（如 PPIO）时，回退为 chat 以支持纯文本对话
+        if self.mdl is None and llm_type == LLMType.IMAGE2TEXT.value:
+            self.mdl = TenantLLMService.model_instance(tenant_id, LLMType.CHAT.value, llm_name, lang=lang, **kwargs)
+            if self.mdl is not None:
+                self.llm_type = LLMType.CHAT.value
         assert self.mdl, "Can't find model for {}/{}/{}".format(tenant_id, llm_type, llm_name)
-        model_config = TenantLLMService.get_model_config(tenant_id, llm_type, llm_name)
+        model_config = TenantLLMService.get_model_config(tenant_id, self.llm_type, llm_name)
         self.max_length = model_config.get("max_tokens", 8192)
 
         self.is_tools = model_config.get("is_tools", False)

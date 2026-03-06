@@ -54,7 +54,9 @@ def create(tenant_id):
             req["llm_id"] = llm.pop("model_name")
             if req.get("llm_id") is not None:
                 llm_name, llm_factory = TenantLLMService.split_model_name_and_factory(req["llm_id"])
-                if not TenantLLMService.query(tenant_id=tenant_id, llm_name=llm_name, llm_factory=llm_factory, model_type="chat"):
+                has_chat = TenantLLMService.query(tenant_id=tenant_id, llm_name=llm_name, llm_factory=llm_factory, model_type="chat")
+                has_image2text = TenantLLMService.query(tenant_id=tenant_id, llm_name=llm_name, llm_factory=llm_factory, model_type="image2text")
+                if not has_chat and not has_image2text:
                     return get_error_data_result(f"`model_name` {req.get('llm_id')} doesn't exist")
         req["llm_setting"] = req.pop("llm")
     e, tenant = TenantService.get_by_id(tenant_id)
@@ -175,7 +177,9 @@ def update(tenant_id, chat_id):
             req["llm_id"] = llm.pop("model_name")
             if req.get("llm_id") is not None:
                 llm_name, llm_factory = TenantLLMService.split_model_name_and_factory(req["llm_id"])
-                if not TenantLLMService.query(tenant_id=tenant_id, llm_name=llm_name, llm_factory=llm_factory, model_type="chat"):
+                has_chat = TenantLLMService.query(tenant_id=tenant_id, llm_name=llm_name, llm_factory=llm_factory, model_type="chat")
+                has_image2text = TenantLLMService.query(tenant_id=tenant_id, llm_name=llm_name, llm_factory=llm_factory, model_type="image2text")
+                if not has_chat and not has_image2text:
                     return get_error_data_result(f"`model_name` {req.get('llm_id')} doesn't exist")
         req["llm_setting"] = req.pop("llm")
     e, tenant = TenantService.get_by_id(tenant_id)
