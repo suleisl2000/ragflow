@@ -853,7 +853,15 @@
             "logo": "",
             "tags": "LLM,TEXT EMBEDDING,SPEECH2TEXT,MODERATION",
             "status": "1",
-            "llm": []
+            "llm": [
+                {
+                    "llm_name": "qwen/qwen3-embedding-8b",
+                    "tags": "TEXT EMBEDDING,8k",
+                    "max_tokens": 8192,
+                    "model_type": "embedding",
+                    "is_tools": false
+                }
+            ]
         },
         {
             "name": "VLLM",
@@ -3262,7 +3270,7 @@
         {
             "name": "PPIO",
             "logo": "",
-            "tags": "LLM",
+            "tags": "LLM,TEXT EMBEDDING",
             "status": "1",
             "llm": [
                 {
@@ -3395,6 +3403,90 @@
                     "max_tokens": 128000,
                     "model_type": "image2text",
                     "is_tools": true
+                },
+                {
+                    "llm_name": "qwen/qwen3.5-35b-a3b",
+                    "tags": "LLM,CHAT,128k",
+                    "max_tokens": 131072,
+                    "model_type": "chat",
+                    "is_tools": true
+                },
+                {
+                    "llm_name": "qwen/qwen3.5-397b-a17b",
+                    "tags": "LLM,CHAT,128k",
+                    "max_tokens": 131072,
+                    "model_type": "chat",
+                    "is_tools": true
+                },
+                {
+                    "llm_name": "qwen/qwen3.5-plus",
+                    "tags": "LLM,CHAT,128k",
+                    "max_tokens": 131072,
+                    "model_type": "chat",
+                    "is_tools": true
+                },
+                {
+                    "llm_name": "moonshotai/kimi-k2.5",
+                    "tags": "LLM,CHAT,128k",
+                    "max_tokens": 131072,
+                    "model_type": "chat",
+                    "is_tools": true
+                },
+                {
+                    "llm_name": "minimax/minimax-m2.5",
+                    "tags": "LLM,CHAT,128k",
+                    "max_tokens": 131072,
+                    "model_type": "chat",
+                    "is_tools": true
+                },
+                {
+                    "llm_name": "minimax/minimax-m2.5-highspeed",
+                    "tags": "LLM,CHAT,128k",
+                    "max_tokens": 131072,
+                    "model_type": "chat",
+                    "is_tools": true
+                },
+                {
+                    "llm_name": "zai-org/glm-5-turbo",
+                    "tags": "LLM,CHAT,128k",
+                    "max_tokens": 131072,
+                    "model_type": "chat",
+                    "is_tools": true
+                },
+                {
+                    "llm_name": "minimax/minimax-m2.1",
+                    "tags": "LLM,CHAT,128k",
+                    "max_tokens": 131072,
+                    "model_type": "chat",
+                    "is_tools": true
+                },
+                {
+                    "llm_name": "deepseek/deepseek-v3.2",
+                    "tags": "LLM,CHAT,128k",
+                    "max_tokens": 131072,
+                    "model_type": "chat",
+                    "is_tools": true
+                },
+                {
+                    "llm_name": "deepseek/deepseek-v3.2-exp",
+                    "tags": "LLM,CHAT,128k",
+                    "max_tokens": 131072,
+                    "model_type": "chat",
+                    "is_tools": true
+                },
+                {
+                    "llm_name": "zai-org/glm-5",
+                    "tags": "LLM,CHAT,128k",
+                    "max_tokens": 131072,
+                    "model_type": "chat",
+                    "is_tools": true
+                },
+                {
+                    "llm_name": "qwen/qwen3-embedding-8b",
+                    "tags": "TEXT EMBEDDING,8k",
+                    "max_tokens": 8192,
+                    "model_type": "embedding",
+                    "is_tools": false
                 }
             ]
         },
